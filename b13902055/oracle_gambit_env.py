@@ -18,6 +18,7 @@ class OracleGambitConfig:
     minority_threshold: float = 0.20
     history_window: int = 50
     payout_threshold: float = 0.20
+    min_winning_ratio_for_payout: float = 1e-3
     max_rounds: int = 500
     min_bet_fraction: float = 0.0
     max_bet_fraction: float = 1.0
@@ -115,7 +116,7 @@ class OracleGambitEnv(gym.Env):
         payouts = np.zeros(c.num_players, dtype=np.float32)
         if total_pool > c.epsilon and total_winning_vol > c.epsilon:
             x = total_winning_vol / total_pool
-            multiplier = 1.0 + (c.surplus_coefficient / max(x, c.epsilon))
+            multiplier = 1.0 + (c.surplus_coefficient / max(x, c.min_winning_ratio_for_payout))
             payouts[winner_mask] = bets[winner_mask] * multiplier
 
         self.balances = self.balances + payouts
@@ -125,7 +126,7 @@ class OracleGambitEnv(gym.Env):
         host_reward = total_pool - total_payout + total_bribes
         self.host_cumulative_profit += host_reward
 
-        player_rewards = payouts - np.where(winner_mask, 0.0, bets) - clamped_bribes
+        player_rewards = payouts - bets - clamped_bribes
 
         door_ratios = np.zeros(c.num_doors, dtype=np.float32)
         if total_pool > c.epsilon:
