@@ -19,6 +19,7 @@ class OracleGambitConfig:
     history_window: int = 50
     payout_threshold: float = 0.20
     min_winning_ratio_for_payout: float = 1e-3
+    max_payout_multiplier: float | None = 100.0
     max_rounds: int = 500
     min_bet_fraction: float = 0.0
     max_bet_fraction: float = 1.0
@@ -117,6 +118,8 @@ class OracleGambitEnv(gym.Env):
         if total_pool > c.epsilon and total_winning_vol > c.epsilon:
             x = total_winning_vol / total_pool
             multiplier = 1.0 + (c.surplus_coefficient / max(x, c.min_winning_ratio_for_payout))
+            if c.max_payout_multiplier is not None:
+                multiplier = min(multiplier, c.max_payout_multiplier)
             payouts[winner_mask] = bets[winner_mask] * multiplier
 
         self.balances = self.balances + payouts
