@@ -30,7 +30,7 @@ Each round follows a strict hierarchical sequence:
 
 ### Phase I: The Bribery Stage
 
-1. **Bribery:** Every player simultaneously decides on a `Bribe_Amount` to offer the Host.
+1. **Bribery:** Every player simultaneously decides on a `Bribe_Fraction` in **[0, 1]** (a proportion of current balance) to offer the Host.
 2. **Signaling:** * The Host observes all bribes.
 * The Host broadcasts a **Public Signal** (a door number, potentially false).
 * The Host sends a **Private Signal** to each player. The accuracy/reliability of this signal is a learned strategy by the Host, influenced by the bribe amount.
@@ -123,7 +123,7 @@ The agents utilize a **Hierarchical Transformer Encoder**.
 1. **Feature Embedding:** Converts history and signals into high-dimensional vectors.
 2. **Self-Attention (`nhead=8`):** Identifies correlations between bribe amounts and Host honesty over time.
 3. **Dual-Stage Heads:**
-* **Bidding Head:** Outputs the `Bribe_Amount`.
+* **Bidding Head:** Outputs the `Bribe_Fraction` in **[0, 1]**.
 * **Betting Head:** Conditioned on the signal received, outputs the `Door` and `Bet_Amount`.
 
 

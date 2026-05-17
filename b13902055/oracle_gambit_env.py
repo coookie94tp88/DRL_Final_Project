@@ -46,8 +46,8 @@ class OracleGambitConfig:
     # ── Action bounds ───────────────────────────────────────
     min_bet_fraction: float = 0.0
     max_bet_fraction: float = 1.0
-    min_bribe: float = 0.0
-    max_bribe: float = 1e6
+    min_bribe_fraction: float = 0.0
+    max_bribe_fraction: float = 1.0
 
     # ── Misc ────────────────────────────────────────────────
     epsilon: float = 1e-8
@@ -159,8 +159,8 @@ class OracleGambitEnv(gym.Env):
         # ── Player action spaces ────────────────────────────────
         # Phase.BRIBE
         self.player_bribe_action_space = spaces.Box(
-            low=c.min_bribe,
-            high=c.max_bribe,
+            low=c.min_bribe_fraction,
+            high=c.max_bribe_fraction,
             shape=(c.num_players,),
             dtype=np.float32,
         )
@@ -233,7 +233,7 @@ class OracleGambitEnv(gym.Env):
         # spaces (player_bribe_action_space, player_bet_action_space,
         # host_action_space) when building agents.
         self.action_space = spaces.Dict({
-            "player_bribes": self.player_bribe_action_space,
+            "player_bribe_fractions": self.player_bribe_action_space,
             "player_bet": self.player_bet_action_space,
             "host": self.host_action_space,
         })
@@ -294,12 +294,13 @@ class OracleGambitEnv(gym.Env):
 
     def step_bribe(
         self,
-        player_bribes: np.ndarray,
+        player_bribe_fractions: np.ndarray,
     ) -> tuple[dict, dict, bool, bool, dict]:
         """Phase 1 — Players submit bribes.
 
         Args:
-            player_bribes: shape (num_players,), each value is the bribe amount.
+            player_bribe_fractions: shape (num_players,), each value is a fraction in [0, 1]
+                of that player's current balance.
 
         Returns (obs, {}, False, False, info).
         The returned obs carries updated *host* context (host now sees the bribes).
@@ -309,19 +310,17 @@ class OracleGambitEnv(gym.Env):
                 f"step_bribe() must be called in Phase.BRIBE; current phase: {self.phase.name}"
             )
         c = self.cfg
-        player_bribes = np.asarray(player_bribes, dtype=np.float32)
-        if player_bribes.shape != (c.num_players,):
-            raise ValueError(f"player_bribes must have shape ({c.num_players},), got {player_bribes.shape}")
+        player_bribe_fractions = np.asarray(player_bribe_fractions, dtype=np.float32)
+        if player_bribe_fractions.shape != (c.num_players,):
+            raise ValueError(
+                f"player_bribe_fractions must have shape ({c.num_players},), got {player_bribe_fractions.shape}"
+            )
 
         active = self.balances > 0
-        clamped = np.where(
-            active,
-            np.minimum(
-                np.maximum(player_bribes, c.min_bribe),
-                np.minimum(self.balances, c.max_bribe),
-            ),
-            0.0,
+        clamped_fractions = np.clip(
+            player_bribe_fractions, c.min_bribe_fraction, c.max_bribe_fraction
         )
+        clamped = np.where(active, self.balances * clamped_fractions, 0.0).astype(np.float32)
         self.balances -= clamped
         self.current_bribes = clamped.astype(np.float32)
         self.current_total_bribes = float(np.sum(clamped))
@@ -458,12 +457,16 @@ class OracleGambitEnv(gym.Env):
         """Dispatcher: routes to the correct phase method based on self.phase.
 
         Expected keys per phase:
-            Phase.BRIBE  → action["player_bribes"]
+            Phase.BRIBE  → action["player_bribe_fractions"] (or legacy action["player_bribes"])
             Phase.SIGNAL → action["public_signal"], action["private_signals"]
             Phase.BET    → action["player_doors"], action["bet_fractions"]
         """
         if self.phase == Phase.BRIBE:
-            return self.step_bribe(action["player_bribes"])
+            if "player_bribe_fractions" in action:
+                return self.step_bribe(action["player_bribe_fractions"])
+            if "player_bribes" in action:
+                return self.step_bribe(action["player_bribes"])
+            raise KeyError("BRIBE phase requires 'player_bribe_fractions' action key")
         if self.phase == Phase.SIGNAL:
             return self.step_signal(action["public_signal"], action["private_signals"])
         return self.step_bet(action["player_doors"], action["bet_fractions"])
