@@ -119,7 +119,7 @@ def main():
     
     # 設定參數 (縮小 max_bribe_fraction 防止第一回合就破產)
     config = OracleGambitConfig(
-        num_players=5, 
+        num_players=10, 
         num_doors=4, 
         max_rounds=10, 
         initial_balance=1000.0,
