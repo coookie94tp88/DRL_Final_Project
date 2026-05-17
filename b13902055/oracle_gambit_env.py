@@ -117,6 +117,7 @@ class OracleGambitEnv(gym.Env):
 
         3. step_bet(player_doors, player_bet_fractions)
                Players choose a door and a bet fraction of their balance.
+               Effective bribe/bet amounts are integer dollars via np.floor.
                Settlement is computed; rewards and new observations are returned.
 
     Separate action spaces (do NOT mix):
@@ -300,7 +301,7 @@ class OracleGambitEnv(gym.Env):
 
         Args:
             player_bribe_fractions: shape (num_players,), each value is a fraction in [0, 1]
-                of that player's current balance.
+                of that player's current balance; paid bribe is floored to integer dollars.
 
         Returns (obs, {}, False, False, info).
         The returned obs carries updated *host* context (host now sees the bribes).
@@ -320,7 +321,7 @@ class OracleGambitEnv(gym.Env):
         clamped_fractions = np.clip(
             player_bribe_fractions, c.min_bribe_fraction, c.max_bribe_fraction
         )
-        clamped = np.where(active, self.balances * clamped_fractions, 0.0).astype(np.float32)
+        clamped = np.where(active, np.floor(self.balances * clamped_fractions), 0.0).astype(np.float32)
         self.balances -= clamped
         self.current_bribes = clamped.astype(np.float32)
         self.current_total_bribes = float(np.sum(clamped))
@@ -369,6 +370,8 @@ class OracleGambitEnv(gym.Env):
         Args:
             player_doors: shape (num_players,), door index chosen by each player.
             player_bet_fractions: shape (num_players,), fraction of balance to bet [0, 1].
+                Effective bet is floored to integer dollars, with a minimum bet of $1
+                for alive players who can afford at least $1.
 
         Returns (obs, rewards, terminated, truncated, info).
             rewards = {"players": ndarray (num_players,), "host": float}
@@ -390,7 +393,11 @@ class OracleGambitEnv(gym.Env):
         active = self.balances > 0
         chosen_doors = np.clip(player_doors, 0, c.num_doors - 1)
         clamped_fractions = np.clip(player_bet_fractions, c.min_bet_fraction, c.max_bet_fraction)
-        bets = np.where(active, self.balances * clamped_fractions, 0.0).astype(np.float32)
+        max_affordable_int = np.floor(self.balances)
+        can_afford_one = active & (max_affordable_int >= 1.0)
+        raw_bets = np.floor(self.balances * clamped_fractions)
+        raw_bets = np.where(can_afford_one, np.maximum(raw_bets, 1.0), 0.0)
+        bets = np.where(can_afford_one, np.minimum(raw_bets, max_affordable_int), 0.0).astype(np.float32)
         self.balances -= bets
 
         winning_door = self.current_winning_door

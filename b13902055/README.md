@@ -30,7 +30,8 @@ Each round follows a strict hierarchical sequence:
 
 ### Phase I: The Bribery Stage
 
-1. **Bribery:** Every player simultaneously decides on a `Bribe_Fraction` in **[0, 1]** (a proportion of current balance) to offer the Host.
+1. **Bribery:** Every player simultaneously decides on a `Bribe_Fraction` in **[0, 1]** (a proportion of current balance) to offer the Host.  
+   The actual paid bribe is `floor(balance * Bribe_Fraction)` in integer dollars, and can be **0**.
 2. **Signaling:** * The Host observes all bribes.
 * The Host broadcasts a **Public Signal** (a door number, potentially false).
 * The Host sends a **Private Signal** to each player. The accuracy/reliability of this signal is a learned strategy by the Host, influenced by the bribe amount.
@@ -41,7 +42,8 @@ Each round follows a strict hierarchical sequence:
 
 1. **Action:** Players receive the signals and choose:
 * Which **Door** to pick (1-4).
-* How much to **Bet** (a portion of their current balance).
+* How much to **Bet** (a portion of their current balance).  
+  The actual bet is `floor(balance * Bet_Fraction)` in integer dollars, with a minimum bet of **$1** for alive players that can afford at least $1.
 
 
 2. **Settlement:** The correct door is revealed. Balances are updated, and the Host calculates its net profit/loss.
