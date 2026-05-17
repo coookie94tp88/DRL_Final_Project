@@ -1,0 +1,4 @@
+base: default.yaml
+sweep:
+  env.max_multiplier: [20, 50, 100, null]
+seeds: [0, 1, 2]

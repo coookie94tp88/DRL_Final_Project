@@ -1,0 +1,4 @@
+base: default.yaml
+sweep:
+  model.parameter_sharing: [encoder, none, full]
+seeds: [0, 1, 2]
