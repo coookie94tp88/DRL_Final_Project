@@ -46,6 +46,7 @@ class OracleGambitConfig:
     # ── Action bounds ───────────────────────────────────────
     min_bet_fraction: float = 0.0
     max_bet_fraction: float = 1.0
+    min_bet_dollars: float = 1.0
     min_bribe_fraction: float = 0.0
     max_bribe_fraction: float = 1.0
 
@@ -323,7 +324,7 @@ class OracleGambitEnv(gym.Env):
         )
         clamped = np.where(active, np.floor(self.balances * clamped_fractions), 0.0).astype(np.float32)
         self.balances -= clamped
-        self.current_bribes = clamped.astype(np.float32)
+        self.current_bribes = clamped
         self.current_total_bribes = float(np.sum(clamped))
 
         self.phase = Phase.SIGNAL
@@ -394,11 +395,12 @@ class OracleGambitEnv(gym.Env):
         chosen_doors = np.clip(player_doors, 0, c.num_doors - 1)
         clamped_fractions = np.clip(player_bet_fractions, c.min_bet_fraction, c.max_bet_fraction)
         max_affordable_dollars = np.floor(self.balances)
-        can_afford_one = active & (max_affordable_dollars >= 1.0)
+        min_bet_dollars = float(c.min_bet_dollars)
+        can_afford_min_bet = active & (max_affordable_dollars >= min_bet_dollars)
         raw_bets = np.floor(self.balances * clamped_fractions)
         bets = np.where(
-            can_afford_one,
-            np.minimum(np.maximum(raw_bets, 1.0), max_affordable_dollars),
+            can_afford_min_bet,
+            np.minimum(np.maximum(raw_bets, min_bet_dollars), max_affordable_dollars),
             0.0,
         ).astype(np.float32)
         self.balances -= bets
