@@ -41,7 +41,7 @@ class OracleGambitConfig:
     # ── Payout formula ──────────────────────────────────────
     payout_threshold: float = 0.20              # break-even winning ratio
     min_winning_ratio_for_payout: float = 1e-3  # floor for division stability
-    max_payout_multiplier: float | None = 100.0 # optional cap on multiplier
+    max_payout_multiplier: float | None = 100.0  # optional cap on multiplier
 
     # ── Action bounds ───────────────────────────────────────
     min_bet_fraction: float = 0.0
@@ -76,7 +76,7 @@ class OracleGambitConfig:
 
     @property
     def current_host_dim(self) -> int:
-        """Host scalar current-context vector length.
+        """Length of the host's current-context feature vector.
         Fields: cumulative_profit, current_total_bribes,
                 winning_door_onehot (num_doors values)
         """
@@ -479,7 +479,8 @@ class OracleGambitEnv(gym.Env):
             current : (num_players, current_player_dim)  — context scalars
                       Fields: [alive, balance, bribe_sent, public_signal, private_signal]
                       -1 padding for fields not yet available this phase.
-                      All zeros for eliminated players (per spec).
+                      All zeros for eliminated players (balance <= 0), using the
+                      alive=0 sentinel to distinguish elimination from padding.
             history : (num_players, history_window, hist_player_dim)  — past rounds
                       All zeros for eliminated players.
         """
@@ -549,15 +550,16 @@ class OracleGambitEnv(gym.Env):
             winning_one_hot,
         ])  # (2 + num_doors,)
 
-        # players snapshot
+        # players snapshot — eliminated players are represented as all-zeros
+        active_mask_bool = self.balances > 0
+        active_mask = active_mask_bool.astype(np.float32)
         balances = self.balances.copy().astype(np.float32)
         if c.normalize_balance_in_obs:
             balances = balances / max(c.initial_balance, c.epsilon)
-        active_mask = (self.balances > 0).astype(np.float32)
-        # Eliminated players: zero their snapshot
-        active_mask_bool = self.balances > 0
         balances = np.where(active_mask_bool, balances, 0.0)
-        players = np.stack([balances, active_mask, self.current_bribes], axis=1)  # (N, 3)
+        # Bribes for eliminated players are also zeroed for consistency
+        visible_bribes = np.where(active_mask_bool, self.current_bribes, 0.0)
+        players = np.stack([balances, active_mask, visible_bribes], axis=1)  # (N, 3)
 
         # history: private signal distribution per past step
         priv_dist = np.zeros((c.history_window, c.num_doors), dtype=np.float32)
