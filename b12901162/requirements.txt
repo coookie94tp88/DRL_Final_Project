@@ -1,0 +1,9 @@
+torch>=2.1
+numpy>=1.24
+scipy>=1.10
+pettingzoo>=1.24
+gymnasium>=0.29
+pyyaml>=6.0
+tensorboard>=2.14
+tyro>=0.7
+pytest>=7.4

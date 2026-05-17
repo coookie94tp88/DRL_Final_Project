@@ -1,0 +1,4 @@
+base: default.yaml
+sweep:
+  env.num_players: [4, 10, 20]
+seeds: [0, 1, 2]

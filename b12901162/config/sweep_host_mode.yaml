@@ -1,0 +1,4 @@
+base: default.yaml
+sweep:
+  host_mode: [learned, scripted_truthful, scripted_noisy]
+seeds: [0, 1, 2]

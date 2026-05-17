@@ -1,0 +1,71 @@
+# DooRL default configuration. Override any field via CLI:
+#   python -m doorl.train --config config/default.yaml --run-name myrun --override env.num_players=4
+
+env:
+  payout_threshold: 0.20            # tau; Host break-even point
+  num_players: 10
+  initial_balance: 1000.0
+  history_window: 50
+  max_rounds: 200
+  max_multiplier: 50                # null disables the cap
+  min_bet: 1.0
+  balance_visibility: full          # {full, own_only, noisy}
+  balance_noise_sigma: 0.1
+  bribery_floor: 0.0                # set by anti_babbling curriculum if enabled
+
+model:
+  d_model: 128
+  n_layers: 2
+  nhead: 8
+  dim_ff: 256
+  dropout: 0.1
+  history_len: 50
+  parameter_sharing: encoder        # {encoder, none, full}
+
+train:
+  algo: happo
+  lr: 2.0e-4
+  gamma: 0.99
+  gae_lambda: 0.95
+  clip_range: 0.2
+  clip_range_vf: 0.2
+  ent_coef: 0.01
+  vf_coef: 0.5
+  grad_clip: 0.5
+  target_kl: 0.02
+  n_steps: 2048
+  n_epochs: 4
+  minibatch_size: 256
+  num_envs: 1
+  total_timesteps: 20000000
+  reward_norm: true
+  agent_update_order: random
+  warmup_steps: 0
+  log_interval: 1
+  seed: 0
+  # Periodic checkpoints (safe to stop training early)
+  checkpoint_interval_iters: 25   # save runs/<name>/ckpt/latest.pt every N PPO iters
+  checkpoint_early_frac: 0.10     # once at ~10% → ckpt/early.pt (cross-play "little trained")
+  checkpoint_mid_frac: 0.50     # once at ~50% → ckpt/mid.pt
+  adv_clip: 5.0                   # clip normalized advantages
+  reward_norm_clip: 10.0          # clip per-agent normalized rewards
+  log_ratio_clip: 20.0            # clamp log pi ratio before exp
+  max_beta_concentration: 100.0   # cap Beta alpha/beta in player policy
+  # Live game view during training (stdout + runs/<run>/watch_log.txt)
+  watch_interval_iters: 50        # 0 = off; play one short episode every N PPO iters
+  watch_max_rounds: 8
+  watch_style: compact            # compact | fancy | plain
+  watch_lang: en                  # en | zh
+  watch_seed_base: 1000
+  anti_babbling:
+    enabled: false
+    init_host_toward_truth: 0.0
+    host_entropy_bonus: 0.0
+    bribery_floor: 0.0
+    warmup_steps: 0
+
+eval:
+  eval_episodes: 500
+  eval_interval: 100000
+  checkpoint_dir: "runs/${run_name}/ckpt"
+  seeds: [0, 1, 2, 3, 4]
