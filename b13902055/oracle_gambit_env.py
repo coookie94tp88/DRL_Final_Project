@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import IntEnum
 from typing import Any
 
 import gymnasium as gym
@@ -8,108 +9,392 @@ import numpy as np
 from gymnasium import spaces
 
 
+# ─────────────────────────────────────────────────────────────
+# Phase enum
+# ─────────────────────────────────────────────────────────────
+
+class Phase(IntEnum):
+    """The three sub-phases that make up one game round."""
+    BRIBE = 0   # players submit bribes → host sees them
+    SIGNAL = 1  # host broadcasts public + private signals → players see them
+    BET = 2     # players choose door + bet fraction → settlement
+
+
+# ─────────────────────────────────────────────────────────────
+# Config
+# ─────────────────────────────────────────────────────────────
+
 @dataclass(frozen=True)
 class OracleGambitConfig:
-    """All tunable environment parameters are defined here before use."""
+    """All tunable environment parameters — define here before using anywhere."""
 
+    # ── Game rules ──────────────────────────────────────────
     num_players: int = 10
     num_doors: int = 4
     initial_balance: float = 1000.0
-    minority_threshold: float = 0.20
-    history_window: int = 50
-    payout_threshold: float = 0.20
-    min_winning_ratio_for_payout: float = 1e-3
-    max_payout_multiplier: float | None = 100.0
+    minority_threshold: float = 0.20    # host profits if winning_ratio < this
     max_rounds: int = 500
+
+    # ── History buffer ──────────────────────────────────────
+    history_window: int = 50            # number of past rounds kept in obs
+
+    # ── Payout formula ──────────────────────────────────────
+    payout_threshold: float = 0.20              # break-even winning ratio
+    min_winning_ratio_for_payout: float = 1e-3  # floor for division stability
+    max_payout_multiplier: float | None = 100.0 # optional cap on multiplier
+
+    # ── Action bounds ───────────────────────────────────────
     min_bet_fraction: float = 0.0
     max_bet_fraction: float = 1.0
     min_bribe: float = 0.0
     max_bribe: float = 1e6
+
+    # ── Misc ────────────────────────────────────────────────
     epsilon: float = 1e-8
     normalize_balance_in_obs: bool = True
 
+    # ── Derived ─────────────────────────────────────────────
     @property
     def surplus_coefficient(self) -> float:
         return 1.0 - self.payout_threshold
 
+    @property
+    def current_player_dim(self) -> int:
+        """Per-player current-context vector length.
+        Fields: [alive, balance, bribe_sent, public_signal, private_signal]
+        Padding -1 is used for fields not yet available in the current phase.
+        """
+        return 5
+
+    @property
+    def hist_player_dim(self) -> int:
+        """Feature count per time-step in a player's history buffer.
+        Fields: choice, public_signal, private_signal, bribe, bet, reward,
+                host_profit, door_ratio_0 … door_ratio_{num_doors-1}
+        """
+        return 7 + self.num_doors
+
+    @property
+    def current_host_dim(self) -> int:
+        """Host scalar current-context vector length.
+        Fields: cumulative_profit, current_total_bribes,
+                winning_door_onehot (num_doors values)
+        """
+        return 2 + self.num_doors
+
+    @property
+    def host_player_state_dim(self) -> int:
+        """Per-player state dimension visible to the host.
+        Fields: [normalized_balance, active_flag, bribe_this_round]
+        """
+        return 3
+
+    @property
+    def hist_host_dim(self) -> int:
+        """Feature count per time-step in the host's history buffer.
+        Fields: host_profit, public_signal,
+                door_ratio_0 … door_ratio_{num_doors-1},
+                private_signal_distribution_0 … (num_doors values)
+        """
+        return 2 + 2 * self.num_doors
+
+
+# ─────────────────────────────────────────────────────────────
+# Environment
+# ─────────────────────────────────────────────────────────────
 
 class OracleGambitEnv(gym.Env):
-    """
-    Multi-agent style environment for future DRL training.
+    """OracleGambit: Strategic Information Manipulation in Multi-Agent RL.
 
-    Step input is a joint action dictionary containing both player actions and host signals.
-    Observations are fixed-size vectors to keep dimensions stable for sequence models.
+    Round flow (three phases per round):
+        1. step_bribe(player_bribes)
+               Players simultaneously submit bribes to the host.
+               Returns host observation (host now sees all bribe amounts).
+
+        2. step_signal(public_signal, private_signals)
+               Host broadcasts one public signal and one private signal per player.
+               Returns player observations (players now have signal context).
+
+        3. step_bet(player_doors, player_bet_fractions)
+               Players choose a door and a bet fraction of their balance.
+               Settlement is computed; rewards and new observations are returned.
+
+    Separate action spaces (do NOT mix):
+        player_bribe_action_space  — used in Phase.BRIBE
+        player_bet_action_space    — used in Phase.BET
+        host_action_space          — used in Phase.SIGNAL
+
+    Observations are structured dicts (NOT flattened) to allow Transformer
+    sequence models to process the history dimension directly:
+        player_observation_space:
+            current : (num_players, current_player_dim)   — phase-context scalars
+            history : (num_players, history_window, hist_player_dim) — past rounds
+
+        host_observation_space:
+            current : (current_host_dim,)                 — global scalars
+            players : (num_players, host_player_state_dim)— per-player snapshot
+            history : (history_window, hist_host_dim)     — past rounds
     """
 
     metadata = {"render_modes": []}
 
-    def __init__(self, config: OracleGambitConfig | None = None, seed: int | None = None) -> None:
+    def __init__(
+        self,
+        config: OracleGambitConfig | None = None,
+        seed: int | None = None,
+    ) -> None:
         super().__init__()
         self.cfg = config or OracleGambitConfig()
         self.rng = np.random.default_rng(seed)
-
         self._build_spaces()
         self._init_state()
 
-    # -------------------------
-    # Public API
-    # -------------------------
-    @property
-    def player_observation_dim(self) -> int:
-        """Fixed per-player observation vector length."""
-        c = self.cfg
-        # current features: alive, balance, last_bribe, current_public_signal, current_private_signal
-        current = 5
-        # history features per step: choice, public_signal, private_signal, bribe, bet, reward, host_profit + door_ratios(num_doors)
-        hist = 7 + c.num_doors
-        return current + c.history_window * hist
+    # ─────────────────────────────────────────────
+    # Action / observation spaces
+    # ─────────────────────────────────────────────
 
-    @property
-    def host_observation_dim(self) -> int:
-        """Fixed host observation vector length."""
+    def _build_spaces(self) -> None:
         c = self.cfg
-        # current features: cumulative_profit, current_pool, current_bribes, winning_door_onehot(num_doors)
-        current = 3 + c.num_doors
-        # player snapshot: balances(num_players), active_mask(num_players)
-        players = 2 * c.num_players
-        # history per step: host_profit, public_signal, door_ratios(num_doors), private_signal_hist(num_doors)
-        hist = 2 + c.num_doors + c.num_doors
-        return current + players + c.history_window * hist
 
-    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+        # ── Player action spaces ────────────────────────────────
+        # Phase.BRIBE
+        self.player_bribe_action_space = spaces.Box(
+            low=c.min_bribe,
+            high=c.max_bribe,
+            shape=(c.num_players,),
+            dtype=np.float32,
+        )
+        # Phase.BET
+        self.player_bet_action_space = spaces.Dict({
+            "doors": spaces.MultiDiscrete([c.num_doors] * c.num_players),
+            "bet_fractions": spaces.Box(
+                low=c.min_bet_fraction,
+                high=c.max_bet_fraction,
+                shape=(c.num_players,),
+                dtype=np.float32,
+            ),
+        })
+
+        # ── Host action space ───────────────────────────────────
+        # Phase.SIGNAL
+        self.host_action_space = spaces.Dict({
+            "public_signal": spaces.Discrete(c.num_doors),
+            "private_signals": spaces.MultiDiscrete([c.num_doors] * c.num_players),
+        })
+
+        # ── Player observation space (structured, NOT flattened) ─
+        self.player_observation_space = spaces.Dict({
+            # current context: 2-D so each row is one player
+            "current": spaces.Box(
+                low=-1.0,
+                high=np.inf,
+                shape=(c.num_players, c.current_player_dim),
+                dtype=np.float32,
+            ),
+            # history: 3-D — (players, time-steps, features)
+            "history": spaces.Box(
+                low=-1.0,
+                high=np.inf,
+                shape=(c.num_players, c.history_window, c.hist_player_dim),
+                dtype=np.float32,
+            ),
+        })
+
+        # ── Host observation space (structured, NOT flattened) ───
+        self.host_observation_space = spaces.Dict({
+            "current": spaces.Box(
+                low=-np.inf,
+                high=np.inf,
+                shape=(c.current_host_dim,),
+                dtype=np.float32,
+            ),
+            # per-player snapshot: 2-D — (players, features)
+            "players": spaces.Box(
+                low=-1.0,
+                high=np.inf,
+                shape=(c.num_players, c.host_player_state_dim),
+                dtype=np.float32,
+            ),
+            # history: 2-D — (time-steps, features)
+            "history": spaces.Box(
+                low=-1.0,
+                high=np.inf,
+                shape=(c.history_window, c.hist_host_dim),
+                dtype=np.float32,
+            ),
+        })
+
+        # gym.Env required attributes (combined for framework compatibility)
+        self.observation_space = spaces.Dict({
+            "players": self.player_observation_space,
+            "host": self.host_observation_space,
+        })
+        # action_space is intentionally a placeholder; use the phase-specific
+        # spaces (player_bribe_action_space, player_bet_action_space,
+        # host_action_space) when building agents.
+        self.action_space = spaces.Dict({
+            "player_bribes": self.player_bribe_action_space,
+            "player_bet": self.player_bet_action_space,
+            "host": self.host_action_space,
+        })
+
+    # ─────────────────────────────────────────────
+    # State initialisation
+    # ─────────────────────────────────────────────
+
+    def _init_state(self) -> None:
+        c = self.cfg
+        self.round_idx: int = 0
+        self.phase: Phase = Phase.BRIBE
+        self.balances: np.ndarray = np.full(c.num_players, c.initial_balance, dtype=np.float32)
+        self.host_cumulative_profit: float = 0.0
+
+        # Within-round transient state (reset at start of every round)
+        self.current_bribes: np.ndarray = np.zeros(c.num_players, dtype=np.float32)
+        self.current_total_bribes: float = 0.0
+        self.current_public_signal: int = -1
+        self.current_private_signals: np.ndarray = np.full(c.num_players, -1, dtype=np.int32)
+        self.current_winning_door: int = -1
+
+        # History buffers (oldest → newest, index -1 is most recent)
+        # -1.0 padding indicates no data for that slot yet
+        self.hist_choices: np.ndarray = np.full(
+            (c.history_window, c.num_players), -1.0, dtype=np.float32)
+        self.hist_public_signal: np.ndarray = np.full(
+            (c.history_window,), -1.0, dtype=np.float32)
+        self.hist_private_signals: np.ndarray = np.full(
+            (c.history_window, c.num_players), -1.0, dtype=np.float32)
+        self.hist_bribes: np.ndarray = np.zeros(
+            (c.history_window, c.num_players), dtype=np.float32)
+        self.hist_bets: np.ndarray = np.zeros(
+            (c.history_window, c.num_players), dtype=np.float32)
+        self.hist_player_rewards: np.ndarray = np.zeros(
+            (c.history_window, c.num_players), dtype=np.float32)
+        self.hist_host_profit: np.ndarray = np.zeros(
+            (c.history_window,), dtype=np.float32)
+        self.hist_door_ratios: np.ndarray = np.zeros(
+            (c.history_window, c.num_doors), dtype=np.float32)
+
+    # ─────────────────────────────────────────────
+    # Public step API
+    # ─────────────────────────────────────────────
+
+    def reset(
+        self,
+        *,
+        seed: int | None = None,
+        options: dict[str, Any] | None = None,
+    ):
         if seed is not None:
             self.rng = np.random.default_rng(seed)
         self._init_state()
-        return self._get_observation(), self._get_info()
+        # Pre-draw the winning door for round 1 (host knows it from the start)
+        self.current_winning_door = int(self.rng.integers(0, self.cfg.num_doors))
+        return self._get_observations(), self._get_info()
 
-    def step(self, action: dict[str, np.ndarray | int | float]):
+    def step_bribe(
+        self,
+        player_bribes: np.ndarray,
+    ) -> tuple[dict, dict, bool, bool, dict]:
+        """Phase 1 — Players submit bribes.
+
+        Args:
+            player_bribes: shape (num_players,), each value is the bribe amount.
+
+        Returns (obs, {}, False, False, info).
+        The returned obs carries updated *host* context (host now sees the bribes).
+        """
+        if self.phase != Phase.BRIBE:
+            raise RuntimeError(
+                f"step_bribe() must be called in Phase.BRIBE; current phase: {self.phase.name}"
+            )
         c = self.cfg
-        self.round_idx += 1
-
-        player_bribes = np.asarray(action["player_bribes"], dtype=np.float32)
-        player_doors = np.asarray(action["player_doors"], dtype=np.int32)
-        player_bet_fractions = np.asarray(action["player_bet_fractions"], dtype=np.float32)
-        host_public_signal = int(action["host_public_signal"])
-        host_private_signals = np.asarray(action["host_private_signals"], dtype=np.int32)
-
-        self._validate_action_shapes(player_bribes, player_doors, player_bet_fractions, host_private_signals)
+        player_bribes = np.asarray(player_bribes, dtype=np.float32)
+        if player_bribes.shape != (c.num_players,):
+            raise ValueError(f"player_bribes must have shape ({c.num_players},), got {player_bribes.shape}")
 
         active = self.balances > 0
-
-        clamped_bribes = np.where(
+        clamped = np.where(
             active,
-            np.minimum(np.maximum(player_bribes, c.min_bribe), np.minimum(self.balances, c.max_bribe)),
+            np.minimum(
+                np.maximum(player_bribes, c.min_bribe),
+                np.minimum(self.balances, c.max_bribe),
+            ),
             0.0,
         )
-        self.balances = self.balances - clamped_bribes
+        self.balances -= clamped
+        self.current_bribes = clamped.astype(np.float32)
+        self.current_total_bribes = float(np.sum(clamped))
 
-        clamped_bet_fractions = np.clip(player_bet_fractions, c.min_bet_fraction, c.max_bet_fraction)
-        bets = np.where(active, self.balances * clamped_bet_fractions, 0.0)
-        self.balances = self.balances - bets
+        self.phase = Phase.SIGNAL
+        return self._get_observations(), {}, False, False, self._get_info()
 
+    def step_signal(
+        self,
+        public_signal: int,
+        private_signals: np.ndarray,
+    ) -> tuple[dict, dict, bool, bool, dict]:
+        """Phase 2 — Host broadcasts signals.
+
+        Args:
+            public_signal: single door index (0 … num_doors-1) broadcast to all.
+            private_signals: shape (num_players,), per-player door hints.
+
+        Returns (obs, {}, False, False, info).
+        The returned obs carries updated *player* context (players now see signals).
+        """
+        if self.phase != Phase.SIGNAL:
+            raise RuntimeError(
+                f"step_signal() must be called in Phase.SIGNAL; current phase: {self.phase.name}"
+            )
+        c = self.cfg
+        private_signals = np.asarray(private_signals, dtype=np.int32)
+        if private_signals.shape != (c.num_players,):
+            raise ValueError(
+                f"private_signals must have shape ({c.num_players},), got {private_signals.shape}"
+            )
+
+        self.current_public_signal = int(np.clip(public_signal, 0, c.num_doors - 1))
+        self.current_private_signals = np.clip(private_signals, 0, c.num_doors - 1)
+
+        self.phase = Phase.BET
+        return self._get_observations(), {}, False, False, self._get_info()
+
+    def step_bet(
+        self,
+        player_doors: np.ndarray,
+        player_bet_fractions: np.ndarray,
+    ) -> tuple[dict, dict[str, Any], bool, bool, dict]:
+        """Phase 3 — Players place bets; settlement is computed.
+
+        Args:
+            player_doors: shape (num_players,), door index chosen by each player.
+            player_bet_fractions: shape (num_players,), fraction of balance to bet [0, 1].
+
+        Returns (obs, rewards, terminated, truncated, info).
+            rewards = {"players": ndarray (num_players,), "host": float}
+        """
+        if self.phase != Phase.BET:
+            raise RuntimeError(
+                f"step_bet() must be called in Phase.BET; current phase: {self.phase.name}"
+            )
+        c = self.cfg
+        player_doors = np.asarray(player_doors, dtype=np.int32)
+        player_bet_fractions = np.asarray(player_bet_fractions, dtype=np.float32)
+        if player_doors.shape != (c.num_players,):
+            raise ValueError(f"player_doors must have shape ({c.num_players},), got {player_doors.shape}")
+        if player_bet_fractions.shape != (c.num_players,):
+            raise ValueError(
+                f"player_bet_fractions must have shape ({c.num_players},), got {player_bet_fractions.shape}"
+            )
+
+        active = self.balances > 0
         chosen_doors = np.clip(player_doors, 0, c.num_doors - 1)
-        winning_door = int(self.rng.integers(0, c.num_doors))
+        clamped_fractions = np.clip(player_bet_fractions, c.min_bet_fraction, c.max_bet_fraction)
+        bets = np.where(active, self.balances * clamped_fractions, 0.0).astype(np.float32)
+        self.balances -= bets
 
+        winning_door = self.current_winning_door
         total_pool = float(np.sum(bets))
         winner_mask = active & (chosen_doors == winning_door) & (bets > 0)
         total_winning_vol = float(np.sum(bets[winner_mask]))
@@ -122,14 +407,14 @@ class OracleGambitEnv(gym.Env):
                 multiplier = min(multiplier, c.max_payout_multiplier)
             payouts[winner_mask] = bets[winner_mask] * multiplier
 
-        self.balances = self.balances + payouts
+        self.balances += payouts
 
         total_payout = float(np.sum(payouts))
-        total_bribes = float(np.sum(clamped_bribes))
-        host_reward = total_pool - total_payout + total_bribes
+        host_reward = total_pool - total_payout + self.current_total_bribes
         self.host_cumulative_profit += host_reward
 
-        player_rewards = payouts - bets - clamped_bribes
+        # R_player = payout - bet_lost - bribe
+        player_rewards = (payouts - bets - self.current_bribes).astype(np.float32)
 
         door_ratios = np.zeros(c.num_doors, dtype=np.float32)
         if total_pool > c.epsilon:
@@ -137,117 +422,216 @@ class OracleGambitEnv(gym.Env):
                 door_ratios[d] = float(np.sum(bets[chosen_doors == d]) / total_pool)
 
         self._push_history(
-            choices=chosen_doors,
-            public_signal=host_public_signal,
-            private_signals=np.clip(host_private_signals, 0, c.num_doors - 1),
-            bribes=clamped_bribes,
+            choices=chosen_doors.astype(np.float32),
+            public_signal=float(self.current_public_signal),
+            private_signals=self.current_private_signals.astype(np.float32),
+            bribes=self.current_bribes,
             bets=bets,
             player_rewards=player_rewards,
             host_profit=host_reward,
             door_ratios=door_ratios,
-            winning_door=winning_door,
         )
 
-        self.current_public_signal = np.clip(host_public_signal, 0, c.num_doors - 1)
-        self.current_private_signals = np.clip(host_private_signals, 0, c.num_doors - 1)
-        self.current_total_pool = total_pool
-        self.current_total_bribes = total_bribes
-        self.current_winning_door = winning_door
-
+        self.round_idx += 1
         terminated = bool(self.round_idx >= c.max_rounds or np.all(self.balances <= 0))
         truncated = False
 
-        rewards = {"players": player_rewards.astype(np.float32), "host": float(host_reward)}
-        obs = self._get_observation()
-        info = self._get_info()
-        return obs, rewards, terminated, truncated, info
-
-    # -------------------------
-    # Internal methods
-    # -------------------------
-    def _build_spaces(self) -> None:
-        c = self.cfg
-        self.observation_space = spaces.Dict(
-            {
-                "players": spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(c.num_players, self.player_observation_dim),
-                    dtype=np.float32,
-                ),
-                "host": spaces.Box(
-                    low=-np.inf,
-                    high=np.inf,
-                    shape=(self.host_observation_dim,),
-                    dtype=np.float32,
-                ),
-            }
-        )
-
-        self.action_space = spaces.Dict(
-            {
-                "player_bribes": spaces.Box(
-                    low=c.min_bribe,
-                    high=c.max_bribe,
-                    shape=(c.num_players,),
-                    dtype=np.float32,
-                ),
-                "player_doors": spaces.MultiDiscrete([c.num_doors] * c.num_players),
-                "player_bet_fractions": spaces.Box(
-                    low=c.min_bet_fraction,
-                    high=c.max_bet_fraction,
-                    shape=(c.num_players,),
-                    dtype=np.float32,
-                ),
-                "host_public_signal": spaces.Discrete(c.num_doors),
-                "host_private_signals": spaces.MultiDiscrete([c.num_doors] * c.num_players),
-            }
-        )
-
-    def _init_state(self) -> None:
-        c = self.cfg
-        self.round_idx = 0
-        self.balances = np.full(c.num_players, c.initial_balance, dtype=np.float32)
-        self.host_cumulative_profit = 0.0
-
-        self.current_public_signal = 0
-        self.current_private_signals = np.zeros(c.num_players, dtype=np.int32)
-        self.current_total_pool = 0.0
+        # Prepare transient state for the next round
+        self.current_bribes = np.zeros(c.num_players, dtype=np.float32)
         self.current_total_bribes = 0.0
-        self.current_winning_door = 0
+        self.current_public_signal = -1
+        self.current_private_signals = np.full(c.num_players, -1, dtype=np.int32)
+        if not terminated:
+            self.current_winning_door = int(self.rng.integers(0, c.num_doors))
+            self.phase = Phase.BRIBE
+        # (If terminated, phase stays at BET; caller should reset before reuse.)
 
-        self.hist_choices = np.full((c.history_window, c.num_players), -1, dtype=np.int32)
-        self.hist_public_signal = np.full(c.history_window, -1, dtype=np.int32)
-        self.hist_private_signals = np.full((c.history_window, c.num_players), -1, dtype=np.int32)
-        self.hist_bribes = np.zeros((c.history_window, c.num_players), dtype=np.float32)
-        self.hist_bets = np.zeros((c.history_window, c.num_players), dtype=np.float32)
-        self.hist_player_rewards = np.zeros((c.history_window, c.num_players), dtype=np.float32)
-        self.hist_host_profit = np.zeros(c.history_window, dtype=np.float32)
-        self.hist_door_ratios = np.zeros((c.history_window, c.num_doors), dtype=np.float32)
-        self.hist_winning_door = np.full(c.history_window, -1, dtype=np.int32)
+        rewards: dict[str, Any] = {
+            "players": player_rewards,
+            "host": float(host_reward),
+        }
+        info = self._get_info()
+        info["winning_door"] = winning_door
+        return self._get_observations(), rewards, terminated, truncated, info
+
+    def step(self, action: dict) -> tuple:
+        """Dispatcher: routes to the correct phase method based on self.phase.
+
+        Expected keys per phase:
+            Phase.BRIBE  → action["player_bribes"]
+            Phase.SIGNAL → action["public_signal"], action["private_signals"]
+            Phase.BET    → action["player_doors"], action["bet_fractions"]
+        """
+        if self.phase == Phase.BRIBE:
+            return self.step_bribe(action["player_bribes"])
+        if self.phase == Phase.SIGNAL:
+            return self.step_signal(action["public_signal"], action["private_signals"])
+        return self.step_bet(action["player_doors"], action["bet_fractions"])
+
+    # ─────────────────────────────────────────────
+    # Observation construction (structured, NOT flattened)
+    # ─────────────────────────────────────────────
+
+    def _get_player_obs(self) -> dict[str, np.ndarray]:
+        """Build player observations.
+
+        Returns:
+            current : (num_players, current_player_dim)  — context scalars
+                      Fields: [alive, balance, bribe_sent, public_signal, private_signal]
+                      -1 padding for fields not yet available this phase.
+                      All zeros for eliminated players (per spec).
+            history : (num_players, history_window, hist_player_dim)  — past rounds
+                      All zeros for eliminated players.
+        """
+        c = self.cfg
+
+        current = np.zeros((c.num_players, c.current_player_dim), dtype=np.float32)
+        for i in range(c.num_players):
+            if self.balances[i] <= 0:
+                # Eliminated: full row stays zero
+                continue
+            bal = self.balances[i]
+            if c.normalize_balance_in_obs:
+                bal = bal / max(c.initial_balance, c.epsilon)
+            bribe = float(self.current_bribes[i])
+            pub = float(self.current_public_signal)    # -1 before SIGNAL phase
+            priv = float(self.current_private_signals[i])  # -1 before SIGNAL phase
+            current[i] = [1.0, bal, bribe, pub, priv]
+
+        # history: (num_players, W, hist_player_dim)
+        # Stack per-player slices then transpose to (players, W, features)
+        # Fields: [choice, pub_sig, priv_sig, bribe, bet, reward, host_profit, *door_ratios]
+        player_hist_list = []
+        for i in range(c.num_players):
+            if self.balances[i] <= 0:
+                player_hist_list.append(
+                    np.zeros((c.history_window, c.hist_player_dim), dtype=np.float32)
+                )
+                continue
+            step_features = np.stack([
+                self.hist_choices[:, i],           # (W,)
+                self.hist_public_signal,            # (W,)
+                self.hist_private_signals[:, i],    # (W,)
+                self.hist_bribes[:, i],             # (W,)
+                self.hist_bets[:, i],               # (W,)
+                self.hist_player_rewards[:, i],     # (W,)
+                self.hist_host_profit,              # (W,)
+            ], axis=1)  # (W, 7)
+            full = np.concatenate([step_features, self.hist_door_ratios], axis=1)  # (W, 7+D)
+            player_hist_list.append(full.astype(np.float32))
+
+        history = np.stack(player_hist_list, axis=0)  # (N, W, hist_player_dim)
+        return {"current": current, "history": history}
+
+    def _get_host_obs(self) -> dict[str, np.ndarray]:
+        """Build host observation.
+
+        Returns:
+            current : (current_host_dim,)
+                      Fields: [cumulative_profit, total_bribes_this_round,
+                               winning_door_onehot × num_doors]
+            players : (num_players, host_player_state_dim)
+                      Fields per player: [normalized_balance, active_flag, bribe_this_round]
+                      Zeros for eliminated players.
+            history : (history_window, hist_host_dim)
+                      Fields per step: [host_profit, public_signal,
+                                        door_ratios × num_doors,
+                                        private_signal_distribution × num_doors]
+        """
+        c = self.cfg
+
+        # current
+        winning_one_hot = np.zeros(c.num_doors, dtype=np.float32)
+        if 0 <= self.current_winning_door < c.num_doors:
+            winning_one_hot[self.current_winning_door] = 1.0
+        current = np.concatenate([
+            np.array([self.host_cumulative_profit, self.current_total_bribes], dtype=np.float32),
+            winning_one_hot,
+        ])  # (2 + num_doors,)
+
+        # players snapshot
+        balances = self.balances.copy().astype(np.float32)
+        if c.normalize_balance_in_obs:
+            balances = balances / max(c.initial_balance, c.epsilon)
+        active_mask = (self.balances > 0).astype(np.float32)
+        # Eliminated players: zero their snapshot
+        active_mask_bool = self.balances > 0
+        balances = np.where(active_mask_bool, balances, 0.0)
+        players = np.stack([balances, active_mask, self.current_bribes], axis=1)  # (N, 3)
+
+        # history: private signal distribution per past step
+        priv_dist = np.zeros((c.history_window, c.num_doors), dtype=np.float32)
+        for t in range(c.history_window):
+            valid_mask = self.hist_private_signals[t] >= 0
+            if np.any(valid_mask):
+                valid_sigs = self.hist_private_signals[t][valid_mask].astype(int)
+                counts = np.bincount(valid_sigs, minlength=c.num_doors).astype(np.float32)
+                priv_dist[t] = counts / max(float(counts.sum()), 1.0)
+
+        history = np.concatenate([
+            self.hist_host_profit[:, None],              # (W, 1)
+            self.hist_public_signal[:, None],            # (W, 1)
+            self.hist_door_ratios,                       # (W, D)
+            priv_dist,                                   # (W, D)
+        ], axis=1).astype(np.float32)  # (W, 2 + 2*D)
+
+        return {
+            "current": current,
+            "players": players.astype(np.float32),
+            "history": history,
+        }
+
+    def _get_observations(self) -> dict[str, dict]:
+        return {
+            "players": self._get_player_obs(),
+            "host": self._get_host_obs(),
+        }
+
+    # ─────────────────────────────────────────────
+    # Info dict
+    # ─────────────────────────────────────────────
+
+    def _get_info(self) -> dict[str, Any]:
+        c = self.cfg
+        return {
+            "phase": int(self.phase),
+            "phase_name": self.phase.name,
+            "round": self.round_idx,
+            "active_players": int(np.sum(self.balances > 0)),
+            "host_cumulative_profit": float(self.host_cumulative_profit),
+            # Observation shape hints (useful for model construction)
+            "player_current_shape": (c.num_players, c.current_player_dim),
+            "player_history_shape": (c.num_players, c.history_window, c.hist_player_dim),
+            "host_current_shape": (c.current_host_dim,),
+            "host_players_shape": (c.num_players, c.host_player_state_dim),
+            "host_history_shape": (c.history_window, c.hist_host_dim),
+        }
+
+    # ─────────────────────────────────────────────
+    # History buffer helpers
+    # ─────────────────────────────────────────────
 
     def _push_history(
         self,
         *,
         choices: np.ndarray,
-        public_signal: int,
+        public_signal: float,
         private_signals: np.ndarray,
         bribes: np.ndarray,
         bets: np.ndarray,
         player_rewards: np.ndarray,
         host_profit: float,
         door_ratios: np.ndarray,
-        winning_door: int,
     ) -> None:
-        self.hist_choices = np.roll(self.hist_choices, shift=-1, axis=0)
-        self.hist_public_signal = np.roll(self.hist_public_signal, shift=-1, axis=0)
-        self.hist_private_signals = np.roll(self.hist_private_signals, shift=-1, axis=0)
-        self.hist_bribes = np.roll(self.hist_bribes, shift=-1, axis=0)
-        self.hist_bets = np.roll(self.hist_bets, shift=-1, axis=0)
-        self.hist_player_rewards = np.roll(self.hist_player_rewards, shift=-1, axis=0)
-        self.hist_host_profit = np.roll(self.hist_host_profit, shift=-1, axis=0)
-        self.hist_door_ratios = np.roll(self.hist_door_ratios, shift=-1, axis=0)
-        self.hist_winning_door = np.roll(self.hist_winning_door, shift=-1, axis=0)
+        """Shift all history buffers by one step and write new values at [-1]."""
+        self.hist_choices = np.roll(self.hist_choices, -1, axis=0)
+        self.hist_public_signal = np.roll(self.hist_public_signal, -1, axis=0)
+        self.hist_private_signals = np.roll(self.hist_private_signals, -1, axis=0)
+        self.hist_bribes = np.roll(self.hist_bribes, -1, axis=0)
+        self.hist_bets = np.roll(self.hist_bets, -1, axis=0)
+        self.hist_player_rewards = np.roll(self.hist_player_rewards, -1, axis=0)
+        self.hist_host_profit = np.roll(self.hist_host_profit, -1, axis=0)
+        self.hist_door_ratios = np.roll(self.hist_door_ratios, -1, axis=0)
 
         self.hist_choices[-1] = choices
         self.hist_public_signal[-1] = public_signal
@@ -257,130 +641,3 @@ class OracleGambitEnv(gym.Env):
         self.hist_player_rewards[-1] = player_rewards
         self.hist_host_profit[-1] = host_profit
         self.hist_door_ratios[-1] = door_ratios
-        self.hist_winning_door[-1] = winning_door
-
-    def _player_obs_for(self, player_idx: int) -> np.ndarray:
-        c = self.cfg
-        if self.balances[player_idx] <= 0:
-            # Requirement: if out of game, state is represented by 0.
-            return np.zeros(self.player_observation_dim, dtype=np.float32)
-
-        balance = self.balances[player_idx]
-        if c.normalize_balance_in_obs:
-            balance = balance / max(c.initial_balance, c.epsilon)
-
-        current = np.array(
-            [
-                1.0,
-                float(balance),
-                float(self.hist_bribes[-1, player_idx]),
-                float(self.current_public_signal),
-                float(self.current_private_signals[player_idx]),
-            ],
-            dtype=np.float32,
-        )
-
-        hist_choices = self.hist_choices[:, player_idx].astype(np.float32)
-        hist_pub = self.hist_public_signal.astype(np.float32)
-        hist_priv = self.hist_private_signals[:, player_idx].astype(np.float32)
-        hist_bribe = self.hist_bribes[:, player_idx]
-        hist_bet = self.hist_bets[:, player_idx]
-        hist_reward = self.hist_player_rewards[:, player_idx]
-        hist_host_profit = self.hist_host_profit
-
-        hist = np.concatenate(
-            [
-                hist_choices[:, None],
-                hist_pub[:, None],
-                hist_priv[:, None],
-                hist_bribe[:, None],
-                hist_bet[:, None],
-                hist_reward[:, None],
-                hist_host_profit[:, None],
-                self.hist_door_ratios,
-            ],
-            axis=1,
-        ).reshape(-1)
-
-        return np.concatenate([current, hist.astype(np.float32)], axis=0)
-
-    def _host_obs(self) -> np.ndarray:
-        c = self.cfg
-
-        winning_one_hot = np.zeros(c.num_doors, dtype=np.float32)
-        if 0 <= self.current_winning_door < c.num_doors:
-            winning_one_hot[self.current_winning_door] = 1.0
-
-        balances = self.balances.copy()
-        if c.normalize_balance_in_obs:
-            balances = balances / max(c.initial_balance, c.epsilon)
-
-        active_mask = (self.balances > 0).astype(np.float32)
-
-        hist_private_hist = np.zeros((c.history_window, c.num_doors), dtype=np.float32)
-        for t in range(c.history_window):
-            valid = self.hist_private_signals[t] >= 0
-            if np.any(valid):
-                counts = np.bincount(self.hist_private_signals[t, valid], minlength=c.num_doors).astype(np.float32)
-                hist_private_hist[t] = counts / max(np.sum(counts), 1.0)
-
-        hist_block = np.concatenate(
-            [
-                self.hist_host_profit[:, None],
-                self.hist_public_signal.astype(np.float32)[:, None],
-                self.hist_door_ratios,
-                hist_private_hist,
-            ],
-            axis=1,
-        ).reshape(-1)
-
-        current = np.concatenate(
-            [
-                np.array(
-                    [
-                        self.host_cumulative_profit,
-                        self.current_total_pool,
-                        self.current_total_bribes,
-                    ],
-                    dtype=np.float32,
-                ),
-                winning_one_hot,
-            ]
-        )
-
-        return np.concatenate([current, balances.astype(np.float32), active_mask, hist_block.astype(np.float32)])
-
-    def _get_observation(self) -> dict[str, np.ndarray]:
-        players_obs = np.stack([self._player_obs_for(i) for i in range(self.cfg.num_players)], axis=0)
-        host_obs = self._host_obs().astype(np.float32)
-        return {"players": players_obs.astype(np.float32), "host": host_obs}
-
-    def _get_info(self) -> dict[str, Any]:
-        return {
-            "round": self.round_idx,
-            "active_players": int(np.sum(self.balances > 0)),
-            "host_cumulative_profit": float(self.host_cumulative_profit),
-            "player_obs_dim": self.player_observation_dim,
-            "host_obs_dim": self.host_observation_dim,
-        }
-
-    def _validate_action_shapes(
-        self,
-        player_bribes: np.ndarray,
-        player_doors: np.ndarray,
-        player_bet_fractions: np.ndarray,
-        host_private_signals: np.ndarray,
-    ) -> None:
-        n = self.cfg.num_players
-        if player_bribes.shape != (n,):
-            raise ValueError(f"player_bribes must have shape ({n},), got {player_bribes.shape}")
-        if player_doors.shape != (n,):
-            raise ValueError(f"player_doors must have shape ({n},), got {player_doors.shape}")
-        if player_bet_fractions.shape != (n,):
-            raise ValueError(
-                f"player_bet_fractions must have shape ({n},), got {player_bet_fractions.shape}"
-            )
-        if host_private_signals.shape != (n,):
-            raise ValueError(
-                f"host_private_signals must have shape ({n},), got {host_private_signals.shape}"
-            )
