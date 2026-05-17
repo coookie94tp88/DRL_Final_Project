@@ -126,7 +126,7 @@ The agents utilize a **Hierarchical Transformer Encoder**.
 2. **Self-Attention (`nhead=8`):** Identifies correlations between bribe amounts and Host honesty over time.
 3. **Dual-Stage Heads:**
 * **Bribery Head:** Outputs the `Bribe_Fraction` in **[0, 1]**.
-* **Betting Head:** Conditioned on the signal received, outputs the `Door` and `Bet_Amount`.
+* **Betting Head:** Conditioned on the signal received, outputs the `Door` and `Bet_Fraction` in **[0, 1]**.
 
 
 

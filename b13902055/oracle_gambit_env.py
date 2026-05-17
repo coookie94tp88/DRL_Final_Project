@@ -393,12 +393,12 @@ class OracleGambitEnv(gym.Env):
         active = self.balances > 0
         chosen_doors = np.clip(player_doors, 0, c.num_doors - 1)
         clamped_fractions = np.clip(player_bet_fractions, c.min_bet_fraction, c.max_bet_fraction)
-        max_affordable_int = np.floor(self.balances)
-        can_afford_one = active & (max_affordable_int >= 1.0)
+        max_affordable_dollars = np.floor(self.balances)
+        can_afford_one = active & (max_affordable_dollars >= 1.0)
         raw_bets = np.floor(self.balances * clamped_fractions)
         bets = np.where(
             can_afford_one,
-            np.minimum(np.maximum(raw_bets, 1.0), max_affordable_int),
+            np.minimum(np.maximum(raw_bets, 1.0), max_affordable_dollars),
             0.0,
         ).astype(np.float32)
         self.balances -= bets
