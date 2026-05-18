@@ -1,0 +1,4 @@
+base: default.yaml
+sweep:
+  env.balance_visibility: [full, own_only, noisy]
+seeds: [0, 1, 2]
