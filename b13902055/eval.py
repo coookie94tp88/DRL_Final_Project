@@ -1,36 +1,21 @@
 import numpy as np
-import random
 from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 from rich.panel import Panel
 
-# 載入你的環境與自訂 Agent
+# 載入你的環境與雙方 Agent
 from env import OracleGambitEnv, OracleGambitConfig, Phase
-from player_agent import TrainedPlayerAgent  # 假設你將 agent 封裝存在 player_agent.py
+from player_agent import TrainedPlayerAgent  
+from host_agent import TrainedHostAgent      
 
 def get_door_name(door_idx: int) -> str:
     """將數字 0, 1, 2, 3 轉換為 A, B, C, D"""
     if door_idx < 0: return "-"
     return chr(65 + int(door_idx))
 
-def host_policy(bribes, winning_door, num_players, num_doors):
-    """主辦方策略：賄賂前三名給真內線，其餘給隨機訊號"""
-    public_signal = random.randint(0, num_doors - 1)
-    private_signals = np.zeros(num_players, dtype=np.int32)
-    
-    # 找出賄賂金額前 3 名的 index
-    top_3_indices = np.argsort(bribes)[-3:]
-    
-    for i in range(num_players):
-        if i in top_3_indices and bribes[i] > 0:
-            private_signals[i] = winning_door
-        else:
-            private_signals[i] = random.randint(0, num_doors - 1)
-            
-    return public_signal, private_signals
-
 def render_round_log(console: Console, env: OracleGambitEnv, rewards: dict, info: dict, round_num: int):
+    """繪製終端機視覺化表格 (沿用你原本精美的 Rich 設計)"""
     c = env.cfg
     
     correct_door = info["winning_door"]
@@ -48,123 +33,109 @@ def render_round_log(console: Console, env: OracleGambitEnv, rewards: dict, info
         if bets[i] > 0:
             door_totals[choices[i]] += bets[i]
             
-    # ── 1. 標頭 (Header) ──
-    header = Text()
-    header.append(f"Round   {round_num:2d}/{c.max_rounds}  ", style="cyan")
-    header.append("Correct Door: ")
-    header.append(f"🚪{get_door_name(correct_door)}  ", style="bold yellow")
-    header.append("Public Signal: ")
-    pub_style = "bold green" if pub_sig == correct_door else "bold red"
-    pub_icon = "✔" if pub_sig == correct_door else "✖"
-    header.append(f"🚪{get_door_name(pub_sig)}{pub_icon}  ", style=pub_style)
-    host_color = "green" if host_profit >= 0 else "red"
-    header.append(f"Host Reward: {host_profit:+.1f}", style=f"bold {host_color}")
-    
-    console.print(header)
-    
-    # ── 2. 下注分佈圖 (Betting Distribution) ──
-    console.print(f"[grey74]Betting Distribution (total pool: {total_pool:.1f})[/grey74]")
-    win_ratio = 0.0
-    for d in range(c.num_doors):
-        amt = door_totals[d]
-        pct = (amt / total_pool * 100) if total_pool > 0 else 0
-        
-        bar_len = int((pct / 100) * 30)
-        bar = "█" * bar_len
-        bar_text = Text(f" 🚪{get_door_name(d)} │", style="grey74")
-        
-        bar_color = "green" if d == correct_door else "yellow"
-        bar_text.append(f"{bar:<30}", style=bar_color)
-        bar_text.append(f" {pct:5.1f}%  ({amt:6.1f})")
-        
-        if d == correct_door:
-            bar_text.append(" ← ✔ CORRECT", style="bold yellow")
-            win_ratio = pct / 100.0
-            
-        console.print(bar_text)
-        
-    threshold = c.payout_threshold
-    profit_status = "Host profits" if win_ratio <= threshold else "Host loses"
-    console.print(f"[grey74]Win-ratio x = {win_ratio:.3f}   threshold θ={threshold:.2f}  ({profit_status})[/grey74]")
-    
-    # ── 3. 玩家明細表 (Table) ──
-    table = Table(show_header=True, header_style="grey74", box=None, padding=(0, 2))
-    table.add_column("Player")
-    table.add_column("PrivSig")
-    table.add_column("Door")
-    table.add_column("Bribe", justify="right")
-    table.add_column("Bet", justify="right")
-    table.add_column("Balance", justify="right")
-    table.add_column("Reward", justify="right")
-    
-    for i in range(c.num_players):
-        sig = priv_sigs[i]
-        sig_str = f"🚪{get_door_name(sig)}"
-        if sig == correct_door: sig_str += "✔"
-        
-        door = choices[i]
-        door_str = f"🚪{get_door_name(door)}"
-        if door == correct_door: door_str += "✔"
-        
-        rew = player_rewards[i]
-        rew_str = f"[{'green' if rew > 0 else 'red'}]{rew:+.1f}[/]" if rew != 0 else "0.0"
-        bal_str = f"[green]{env.balances[i]:.1f}[/green]"
-        
-        table.add_row(
-            f"player_{i}", sig_str, door_str,
-            f"{bribes[i]:.1f}", f"{bets[i]:.1f}", bal_str, rew_str
-        )
-        
-    console.print(table)
-    console.print(f"[grey74]Bribes total: {np.sum(bribes):.1f}[/grey74]")
-    console.print("[cyan]" + "─"*70 + "[/cyan]\n")
+    door_ratios = np.zeros(c.num_doors)
+    if total_pool > 0:
+        door_ratios = door_totals / total_pool
 
-def main():
+    console.print(f"\n[bold cyan]=== Round {round_num} ==-[/bold cyan]")
+    
+    # --- 頂部摘要 ---
+    summary_text = Text()
+    summary_text.append(f"Winning Door: {get_door_name(correct_door)}\n", style="bold green")
+    summary_text.append(f"Host Public Signal: {get_door_name(pub_sig)}\n", style="bold yellow")
+    summary_text.append(f"Total Pool: {total_pool:.2f}\n", style="bold magenta")
+    summary_text.append(f"Host Profit: {host_profit:.2f}\n", style="bold red" if host_profit < 0 else "bold green")
+    
+    door_ratio_str = " | ".join([f"{get_door_name(d)}: {door_ratios[d]*100:.1f}%" for d in range(c.num_doors)])
+    summary_text.append(f"Door Distribution: [{door_ratio_str}]", style="bold blue")
+    
+    console.print(Panel(summary_text, title="Round Summary", expand=False))
+
+    # --- 玩家詳細資訊 ---
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Player", justify="right")
+    table.add_column("Bal (Start)", justify="right")
+    table.add_column("Bribe", justify="right")
+    table.add_column("Priv Sig", justify="center")
+    table.add_column("Bet", justify="right")
+    table.add_column("Choice", justify="center")
+    table.add_column("Reward", justify="right")
+    table.add_column("Bal (End)", justify="right", style="bold cyan")
+
+    for i in range(c.num_players):
+        bal_start = env.balances[i] - player_rewards[i]
+        bal_end = env.balances[i]
+        b_val = bribes[i]
+        bet_val = bets[i]
+        p_sig = get_door_name(priv_sigs[i])
+        choice_str = get_door_name(choices[i])
+        r_val = player_rewards[i]
+        
+        # 標記贏家
+        if choices[i] == correct_door and bet_val > 0:
+            choice_str = f"[green]{choice_str} ✓[/green]"
+        elif bet_val > 0:
+            choice_str = f"[red]{choice_str} ✗[/red]"
+
+        # 標記真實內線
+        if priv_sigs[i] == correct_door:
+            p_sig = f"[green]{p_sig}[/green]"
+
+        table.add_row(
+            f"P{i}",
+            f"{bal_start:.1f}",
+            f"{b_val:.1f}",
+            p_sig,
+            f"{bet_val:.1f}",
+            choice_str,
+            f"[green]+{r_val:.1f}[/green]" if r_val > 0 else f"[red]{r_val:.1f}[/red]",
+            f"{bal_end:.1f}"
+        )
+
+    console.print(table)
+
+
+if __name__ == "__main__":
     console = Console()
     
-    # 初始化環境參數
+    # 這裡填入你剛剛訓練完的 checkpoint 路徑
+    CHECKPOINT_PATH = "checkpoints/marl_checkpoint_ep_400.pth" 
+    
     config = OracleGambitConfig(
         num_players=10, 
         num_doors=4, 
-        max_rounds=20, 
-        initial_balance=1000.0
+        max_rounds=20, # Eval 時可以先看 20 局 
+        initial_balance=1000.0,
     )
     env = OracleGambitEnv(config=config, seed=42)
     obs, info = env.reset()
     
-    # ==========================================
-    # 載入訓練好的 Agent
-    # ==========================================
-    model_path = "checkpoints/sac_checkpoint_ep_1600.pth"
-    console.print(f"🔄 [cyan]正在載入訓練模型: {model_path}[/cyan]")
-    try:
-        agent = TrainedPlayerAgent(model_path=model_path, state_dim=555, num_doors=config.num_doors)
-    except FileNotFoundError:
-        console.print("[bold red]❌ 找不到模型檔案！請確認 checkpoints 資料夾中是否存在該檔案。[/bold red]")
-        return
-
-    console.print(Panel("OracleGambit - Trained Agent Evaluation\n"
-                        f"Players={config.num_players}  Doors={config.num_doors}  Rounds={config.max_rounds}  Seed=42", 
-                        style="bold yellow"))
+    # 動態獲取 hist_dim 以確保網路輸入維度一致
+    hist_dim = obs["host"]["history"].shape[1]
+    
+    # 初始化雙方 Agent (都從同一個 checkpoint 讀取)
+    console.print("[bold yellow]載入 MARL Agents...[/bold yellow]")
+    player_agent = TrainedPlayerAgent(CHECKPOINT_PATH, config, device="cuda") 
+    host_agent = TrainedHostAgent(CHECKPOINT_PATH, config, hist_dim=hist_dim, device="cuda")
+    
+    console.print(Panel(
+        "OracleGambit - AI vs AI Evaluation\n"
+        f"Players={config.num_players}  Doors={config.num_doors}  Rounds={config.max_rounds}", 
+        style="bold yellow"
+    ))
     
     round_count = 1
     
-    # ==========================================
-    # 遊戲主迴圈
-    # ==========================================
     while True:
         if env.phase == Phase.BRIBE:
-            # 1. Agent 推論：決定賄賂比例 (使用 deterministic=True 確保穩定性)
-            bribe_fractions = agent.get_bribe_action(obs["players"], deterministic=True)
+            # 1. 玩家推論：決定賄賂比例 (deterministic=True)
+            bribe_fractions = player_agent.get_bribe_action(obs["players"], deterministic=True)
             action = {"player_bribe_fractions": bribe_fractions}
             obs, _, _, _, info = env.step(action)
             
         elif env.phase == Phase.SIGNAL:
-            # 2. 主辦方 (Host) 給出訊號：前三名給真內線
-            winning_door = env.current_winning_door
-            current_bribes = env.current_bribes
-            pub_sig, priv_sigs = host_policy(current_bribes, winning_door, config.num_players, config.num_doors)
-            
+            # 2. Host 推論：給出公頻與私頻訊號 (使用 RDQN)
+            pub_sig, priv_sigs = host_agent.get_action(env)
             action = {
                 "public_signal": pub_sig,
                 "private_signals": priv_sigs
@@ -172,8 +143,8 @@ def main():
             obs, _, _, _, info = env.step(action)
             
         elif env.phase == Phase.BET:
-            # 3. Agent 推論：決定選哪個門與下注比例
-            doors, bet_fracs = agent.get_bet_action(obs["players"], deterministic=True)
+            # 3. 玩家推論：決定選哪個門與下注比例 (deterministic=True)
+            doors, bet_fracs = player_agent.get_bet_action(obs["players"], deterministic=True)
             action = {
                 "player_doors": doors,
                 "bet_fractions": bet_fracs
@@ -182,11 +153,9 @@ def main():
             
             # 4. 渲染結果
             render_round_log(console, env, rewards, info, round_count)
-            round_count += 1
             
             if terminated or truncated:
-                console.print("[bold red]=== Game Over ===[/bold red]")
+                console.print(f"\n[bold yellow]Game Over at Round {round_count}![/bold yellow]")
                 break
-
-if __name__ == "__main__":
-    main()
+                
+            round_count += 1
