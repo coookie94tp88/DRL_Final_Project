@@ -6,6 +6,7 @@ import torch.optim as optim
 from torch.distributions import Normal
 import random
 import copy
+import os
 
 # 載入自訂環境
 from env import OracleGambitEnv, OracleGambitConfig, Phase
@@ -165,6 +166,9 @@ def train():
     # 初始化環境與維度
     config = OracleGambitConfig(num_players=10, max_rounds=200, initial_balance=1000)
     env = OracleGambitEnv(config=config)
+
+    checkpoint_dir = "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
     
     state_dim = 5 + (50 * 11) # current(5) + history(50*11)
     
@@ -196,7 +200,7 @@ def train():
     episodes = 0
     
     print("開始訓練 Two-Step SAC...")
-    for step in range(50000): # 總訓練步數
+    for step in range(500000): # 總訓練步數
         
         # === 階段 1: 賄賂 (Actor 1) ===
         s1_tensor = flatten_obs(s1_dict, device)
@@ -256,8 +260,24 @@ def train():
             obs, info = env.reset()
             s1_dict = obs["players"]
             episodes += 1
+            
+            # --- 列印訓練進度 ---
             if episodes % 10 == 0:
                 print(f"Episode: {episodes}, Avg Reward: {episode_reward/10:.2f}")
+            
+            # --- 新增：定期保存模型 (例如每 100 局存一次) ---
+            if episodes % 100 == 0:
+                save_path = os.path.join(checkpoint_dir, f"sac_checkpoint_ep_{episodes}.pth")
+                # 我們把 4 個網路的權重包成一個字典存起來
+                torch.save({
+                    'episode': episodes,
+                    'actor1_state_dict': actor1.state_dict(),
+                    'actor2_state_dict': actor2.state_dict(),
+                    'critic1_state_dict': critic1.state_dict(),
+                    'critic2_state_dict': critic2.state_dict(),
+                }, save_path)
+                print(f"💾 [Checkpoint] 模型已儲存至: {save_path}")
+
             episode_reward = 0
 
         # === 神經網路訓練更新 ===
@@ -333,6 +353,14 @@ def train():
                 target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
             for param, target_param in zip(critic2.parameters(), critic2_target.parameters()):
                 target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-
+    final_path = os.path.join(checkpoint_dir, "sac_final_model.pth")
+    torch.save({
+        'episode': episodes,
+        'actor1_state_dict': actor1.state_dict(),
+        'actor2_state_dict': actor2.state_dict(),
+        'critic1_state_dict': critic1.state_dict(),
+        'critic2_state_dict': critic2.state_dict(),
+    }, final_path)
+    print(f"🎉 訓練完成！最終模型已儲存至: {final_path}")
 if __name__ == "__main__":
     train()
