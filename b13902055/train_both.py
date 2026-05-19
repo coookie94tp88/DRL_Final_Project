@@ -334,8 +334,10 @@ def train_both(
     bribe_log_std_min, bribe_log_std_max = -5.0, 1.0
     bet_log_std_min, bet_log_std_max = -5.0, 1.0
     bet_gumbel_tau = 0.8
-    p_alpha = 0.10
+    player_sac_alpha = 0.10
     h_eps_decay = 0.9995
+    grad_clip_norm = 1.0
+    max_loop_iters = total_bet_steps * 4
 
     player_actor1 = BribeActor(
         num_doors=config.num_doors,
@@ -400,7 +402,13 @@ def train_both(
 
     print("🔥 Start co-training (player SAC + host RDQN)")
 
+    loop_iters = 0
     while bet_steps < total_bet_steps:
+        loop_iters += 1
+        if loop_iters > max_loop_iters:
+            raise RuntimeError(
+                "Training loop exceeded safety iteration cap before reaching target bet steps."
+            )
         if env.phase == Phase.BRIBE:
             s1_dict = obs["players"]
             s1_tensor = flatten_obs_player(s1_dict, device)
@@ -485,6 +493,7 @@ def train_both(
 
             s1_next_dict = next_obs["players"]
             s1_next_tensor = flatten_obs_player(s1_next_dict, device)
+            # The environment terminates globally (all agents share one done signal).
             done_arr = np.full((config.num_players, 1), float(terminated or truncated), dtype=np.float32)
 
             player_buffer.add(
@@ -510,45 +519,45 @@ def train_both(
                 with torch.no_grad():
                     next_a1, next_log_pi1 = player_actor1.sample(s1_next)
                     target_q1_a, target_q1_b = player_critic1_target(s1_next, next_a1)
-                    target_v1 = torch.min(target_q1_a, target_q1_b) - p_alpha * next_log_pi1
+                    target_v1 = torch.min(target_q1_a, target_q1_b) - player_sac_alpha * next_log_pi1
                     target_q2 = r2 + p_gamma * (1 - done) * target_v1
 
                 current_q2_a, current_q2_b = player_critic2(s2, a2)
                 q2_loss = F.mse_loss(current_q2_a, target_q2) + F.mse_loss(current_q2_b, target_q2)
                 p_opt_c2.zero_grad()
                 q2_loss.backward()
-                torch.nn.utils.clip_grad_norm_(player_critic2.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(player_critic2.parameters(), max_norm=grad_clip_norm)
                 p_opt_c2.step()
 
                 with torch.no_grad():
                     _, next_door_onehot, next_bet_frac, next_log_pi2 = player_actor2.sample(s2)
                     next_a2 = torch.cat([next_door_onehot, next_bet_frac], dim=-1)
                     target_q2_a, target_q2_b = player_critic2_target(s2, next_a2)
-                    target_v2 = torch.min(target_q2_a, target_q2_b) - p_alpha * next_log_pi2
+                    target_v2 = torch.min(target_q2_a, target_q2_b) - player_sac_alpha * next_log_pi2
                     target_q1 = r1 + p_gamma * (1 - done) * target_v2
 
                 current_q1_a, current_q1_b = player_critic1(s1, a1)
                 q1_loss = F.mse_loss(current_q1_a, target_q1) + F.mse_loss(current_q1_b, target_q1)
                 p_opt_c1.zero_grad()
                 q1_loss.backward()
-                torch.nn.utils.clip_grad_norm_(player_critic1.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(player_critic1.parameters(), max_norm=grad_clip_norm)
                 p_opt_c1.step()
 
                 _, curr_door_onehot, curr_bet_frac, log_pi2 = player_actor2.sample(s2)
                 curr_a2 = torch.cat([curr_door_onehot, curr_bet_frac], dim=-1)
                 q2_pi_a, q2_pi_b = player_critic2(s2, curr_a2)
-                a2_loss = (p_alpha * log_pi2 - torch.min(q2_pi_a, q2_pi_b)).mean()
+                a2_loss = (player_sac_alpha * log_pi2 - torch.min(q2_pi_a, q2_pi_b)).mean()
                 p_opt_a2.zero_grad()
                 a2_loss.backward()
-                torch.nn.utils.clip_grad_norm_(player_actor2.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(player_actor2.parameters(), max_norm=grad_clip_norm)
                 p_opt_a2.step()
 
                 curr_a1, log_pi1 = player_actor1.sample(s1)
                 q1_pi_a, q1_pi_b = player_critic1(s1, curr_a1)
-                a1_loss = (p_alpha * log_pi1 - torch.min(q1_pi_a, q1_pi_b)).mean()
+                a1_loss = (player_sac_alpha * log_pi1 - torch.min(q1_pi_a, q1_pi_b)).mean()
                 p_opt_a1.zero_grad()
                 a1_loss.backward()
-                torch.nn.utils.clip_grad_norm_(player_actor1.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(player_actor1.parameters(), max_norm=grad_clip_norm)
                 p_opt_a1.step()
 
                 for p, tp in zip(player_critic1.parameters(), player_critic1_target.parameters()):
@@ -579,7 +588,7 @@ def train_both(
                 h_loss = F.mse_loss(total_q, target_q)
                 h_opt.zero_grad()
                 h_loss.backward()
-                torch.nn.utils.clip_grad_norm_(host_rdqn.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(host_rdqn.parameters(), max_norm=grad_clip_norm)
                 h_opt.step()
 
                 for p, tp in zip(host_rdqn.parameters(), host_target_rdqn.parameters()):
