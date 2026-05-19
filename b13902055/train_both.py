@@ -17,19 +17,16 @@ from env import OracleGambitEnv, OracleGambitConfig, Phase
 # ==========================================
 
 def flatten_obs_player(obs_dict, device):
-    """將 Player 的 current 和 history 攤平成一個 1D 向量"""
-    curr = torch.FloatTensor(obs_dict["current"]).to(device)       # (N, 5)
-    hist = torch.FloatTensor(obs_dict["history"]).to(device)       # (N, 50, 11)
-    hist_flat = hist.view(hist.shape[0], -1)                       # (N, 550)
-    return torch.cat([curr, hist_flat], dim=1)                     # (N, 555)
+    curr = torch.FloatTensor(obs_dict["current"]).to(device)       
+    hist = torch.FloatTensor(obs_dict["history"]).to(device)       
+    hist_flat = hist.view(hist.shape[0], -1)                       
+    return torch.cat([curr, hist_flat], dim=1)                     
 
-def encode_features(state_flat, num_doors=4, seq_len=50):
-    """將 555 維資料還原，並對離散訊號進行 One-Hot Encoding"""
+def encode_features(state_flat, num_doors=3, seq_len=50): # 🎯 預設改成 3 扇門
     N = state_flat.shape[0]
     curr = state_flat[:, :5]
-    hist = state_flat[:, 5:].view(N, seq_len, 11)
+    hist = state_flat[:, 5:].view(N, seq_len, 7 + num_doors)
     
-    # ─── 處理 Current 狀態 ───
     alive_bal_bribe = curr[:, 0:3] 
     pub_sig = curr[:, 3].long()
     priv_sig = curr[:, 4].long()
@@ -41,7 +38,6 @@ def encode_features(state_flat, num_doors=4, seq_len=50):
     priv_onehot = F.one_hot(priv_sig, num_classes=num_doors+1).float()
     curr_encoded = torch.cat([alive_bal_bribe, pub_onehot, priv_onehot], dim=1)
     
-    # ─── 處理 History 狀態 ───
     choice = hist[:, :, 0].long()
     h_pub = hist[:, :, 1].long()
     h_priv = hist[:, :, 2].long()
@@ -59,7 +55,8 @@ def encode_features(state_flat, num_doors=4, seq_len=50):
     return curr_encoded, hist_encoded
 
 class TransformerExtractor(nn.Module):
-    def __init__(self, curr_dim=13, hist_dim=23, d_model=128, nhead=4, num_layers=2, seq_len=50):
+    # 🎯 這裡的預設 curr_dim 從 13 改成 11，hist_dim 從 23 改成 20
+    def __init__(self, curr_dim=11, hist_dim=20, d_model=128, nhead=4, num_layers=2, seq_len=50):
         super().__init__()
         self.hist_proj = nn.Linear(hist_dim, d_model)
         self.pos_emb = nn.Parameter(torch.randn(1, seq_len, d_model)) 
@@ -79,17 +76,20 @@ class TransformerExtractor(nn.Module):
         return out
 
 class BribeActor(nn.Module):
-    def __init__(self):
+    def __init__(self, num_doors=3): # 🎯 預設改成 3
         super().__init__()
-        self.extractor = TransformerExtractor()
+        self.num_doors = num_doors
+        curr_dim = 2 * num_doors + 5
+        hist_dim = 4 * num_doors + 7
+        self.extractor = TransformerExtractor(curr_dim=curr_dim, hist_dim=hist_dim)
         self.mu_layer = nn.Linear(256, 1)
         self.log_std_layer = nn.Linear(256, 1)
 
     def forward(self, state_flat):
-        curr_enc, hist_enc = encode_features(state_flat)
+        curr_enc, hist_enc = encode_features(state_flat, num_doors=self.num_doors)
         feat = self.extractor(curr_enc, hist_enc)
         mu = self.mu_layer(feat)
-        log_std = torch.clamp(self.log_std_layer(feat), -20, 2)
+        log_std = torch.clamp(self.log_std_layer(feat), -1.0, 2.0)
         return mu, log_std
 
     def sample(self, state_flat):
@@ -102,15 +102,18 @@ class BribeActor(nn.Module):
         return action, log_prob.sum(dim=-1, keepdim=True)
 
 class BetActor(nn.Module):
-    def __init__(self, num_doors=4):
+    def __init__(self, num_doors=3): # 🎯 預設改成 3
         super().__init__()
-        self.extractor = TransformerExtractor()
+        self.num_doors = num_doors 
+        curr_dim = 2 * num_doors + 5
+        hist_dim = 4 * num_doors + 7
+        self.extractor = TransformerExtractor(curr_dim=curr_dim, hist_dim=hist_dim)
         self.door_logits_layer = nn.Linear(256, num_doors)
         self.bet_mu_layer = nn.Linear(256, 1)
         self.bet_log_std_layer = nn.Linear(256, 1)
 
     def sample(self, state_flat):
-        curr_enc, hist_enc = encode_features(state_flat)
+        curr_enc, hist_enc = encode_features(state_flat, num_doors=self.num_doors)
         feat = self.extractor(curr_enc, hist_enc)
         
         door_logits = self.door_logits_layer(feat)
@@ -120,7 +123,7 @@ class BetActor(nn.Module):
         door_idx = door_one_hot.argmax(dim=-1)
 
         bet_mu = self.bet_mu_layer(feat)
-        bet_log_std = torch.clamp(self.bet_log_std_layer(feat), -20, 2)
+        bet_log_std = torch.clamp(self.bet_log_std_layer(feat), -1.0, 2.0)
         bet_dist = Normal(bet_mu, bet_log_std.exp())
         x_t = bet_dist.rsample()
         bet_fraction = torch.sigmoid(x_t)
@@ -130,16 +133,20 @@ class BetActor(nn.Module):
         return door_idx, door_one_hot, bet_fraction, total_log_prob
 
 class Critic(nn.Module):
-    def __init__(self, action_dim=1):
+    def __init__(self, action_dim=1, num_doors=3): # 🎯 預設改成 3
         super().__init__()
-        self.ext1 = TransformerExtractor()
+        self.num_doors = num_doors
+        curr_dim = 2 * num_doors + 5
+        hist_dim = 4 * num_doors + 7
+        
+        self.ext1 = TransformerExtractor(curr_dim=curr_dim, hist_dim=hist_dim)
         self.q1_head = nn.Sequential(nn.Linear(256 + action_dim, 256), nn.ReLU(), nn.Linear(256, 1))
         
-        self.ext2 = TransformerExtractor()
+        self.ext2 = TransformerExtractor(curr_dim=curr_dim, hist_dim=hist_dim)
         self.q2_head = nn.Sequential(nn.Linear(256 + action_dim, 256), nn.ReLU(), nn.Linear(256, 1))
 
     def forward(self, state_flat, action):
-        curr_enc, hist_enc = encode_features(state_flat)
+        curr_enc, hist_enc = encode_features(state_flat, num_doors=self.num_doors)
         feat1 = self.ext1(curr_enc, hist_enc)
         q1 = self.q1_head(torch.cat([feat1, action], dim=-1))
         
@@ -148,12 +155,12 @@ class Critic(nn.Module):
         return q1, q2
 
 class TwoStepReplayBuffer:
-    def __init__(self, max_size=100000, state_dim=555):
+    def __init__(self, max_size=100000, state_dim=555, num_doors=4):  # 🔴 新增 num_doors
         self.s1 = np.zeros((max_size, state_dim), dtype=np.float32)
         self.a1 = np.zeros((max_size, 1), dtype=np.float32)
         self.r1 = np.zeros((max_size, 1), dtype=np.float32)
         self.s2 = np.zeros((max_size, state_dim), dtype=np.float32)
-        self.a2_door = np.zeros((max_size, 4), dtype=np.float32)
+        self.a2_door = np.zeros((max_size, num_doors), dtype=np.float32)  # 🔴 將 4 改為 num_doors
         self.a2_bet = np.zeros((max_size, 1), dtype=np.float32)
         self.r2 = np.zeros((max_size, 1), dtype=np.float32)
         self.s1_next = np.zeros((max_size, state_dim), dtype=np.float32)
@@ -195,37 +202,27 @@ class TwoStepReplayBuffer:
 # ==========================================
 
 class HostRDQN(nn.Module):
-    def __init__(self, num_players=10, num_doors=4, hist_dim=10, d_model=128):
+    def __init__(self, num_players=10, num_doors=3, hist_dim=10, d_model=128):
         super().__init__()
         self.num_players = num_players
         self.num_doors = num_doors
-        
-        # 歷史序列處理 (LSTM)
         self.lstm = nn.LSTM(input_size=hist_dim, hidden_size=d_model, batch_first=True)
-        
-        # 當下狀態 (Winning Door [One-Hot: 4] + Bribes [10]) = 14 維
         self.fc_curr = nn.Linear(num_doors + num_players, d_model)
-        
-        # 融合層
         self.fc_fusion = nn.Sequential(nn.Linear(d_model * 2, 256), nn.ReLU())
-        
-        # 動作分支 (Q-values)
         self.q_pub = nn.Linear(256, num_doors) 
         self.q_privs = nn.ModuleList([nn.Linear(256, num_doors) for _ in range(num_players)]) 
 
     def forward(self, curr, hist):
+        self.lstm.flatten_parameters() # 避免記憶體連續性警告
         _, (h_n, _) = self.lstm(hist)
-        hist_feat = h_n[-1] # (Batch, d_model)
-        
+        hist_feat = h_n[-1] 
         curr_feat = F.relu(self.fc_curr(curr)) 
         merged = self.fc_fusion(torch.cat([hist_feat, curr_feat], dim=-1))
-        
         q_pub_vals = self.q_pub(merged)
         q_priv_vals = [head(merged) for head in self.q_privs]
         return q_pub_vals, q_priv_vals
 
 def process_host_obs(env, device="cpu"):
-    """直接從 env 提取 Host 所需特徵，避免複雜的 dict 解析"""
     c = env.cfg
     winning_door = env.current_winning_door
     bribes = env.current_bribes
@@ -236,8 +233,6 @@ def process_host_obs(env, device="cpu"):
         
     curr_processed = np.concatenate([win_door_oh, bribes])
     curr_tensor = torch.FloatTensor(curr_processed).unsqueeze(0).to(device)
-    
-    # 提取 history
     hist = env._get_observations()["host"]["history"]
     hist_tensor = torch.FloatTensor(hist).unsqueeze(0).to(device)
     
@@ -276,16 +271,22 @@ def train_both():
     checkpoint_dir = "checkpoints"
     os.makedirs(checkpoint_dir, exist_ok=True)
 
-    config = OracleGambitConfig(num_players=10, num_doors=4, max_rounds=200)
+    # 🎯 【關鍵修改】設定為 3 扇門
+    config = OracleGambitConfig(num_players=10, num_doors=3, max_rounds=200)
     env = OracleGambitEnv(config=config, seed=42)
     
+    # 🔴 動態計算正確的 state_dim： 5 + 50 * (7 + num_doors)
+    state_dim = 5 + config.history_window * (7 + config.num_doors)
+    
     # --- 初始化 Player 網路 (SAC) ---
-    player_actor1 = BribeActor().to(device)
-    player_critic1 = Critic(action_dim=1).to(device)
+    # 🔴 全部傳入正確的 num_doors
+    player_actor1 = BribeActor(num_doors=config.num_doors).to(device)
+    player_critic1 = Critic(action_dim=1, num_doors=config.num_doors).to(device)
     player_critic1_target = copy.deepcopy(player_critic1)
     
     player_actor2 = BetActor(num_doors=config.num_doors).to(device)
-    player_critic2 = Critic(action_dim=5).to(device) 
+    # 🔴 Critic 2 的動作維度是門的一熱編碼 (num_doors) + 下注比例 (1)，即 num_doors + 1
+    player_critic2 = Critic(action_dim=config.num_doors + 1, num_doors=config.num_doors).to(device) 
     player_critic2_target = copy.deepcopy(player_critic2)
 
     p_opt_a1 = optim.Adam(player_actor1.parameters(), lr=3e-4)
@@ -293,8 +294,10 @@ def train_both():
     p_opt_a2 = optim.Adam(player_actor2.parameters(), lr=3e-4)
     p_opt_c2 = optim.Adam(player_critic2.parameters(), lr=3e-4)
     
-    player_buffer = TwoStepReplayBuffer(max_size=100000, state_dim=555)
-    p_gamma, p_tau, p_alpha = 0.99, 0.005, 0.2
+    # 🔴 傳入動態計算的 state_dim 與 num_doors
+    player_buffer = TwoStepReplayBuffer(max_size=100000, state_dim=state_dim, num_doors=config.num_doors)
+    
+    p_gamma, p_tau, p_alpha = 0.99, 0.005, 0.5 
     
     # --- 初始化 Host 網路 (RDQN) ---
     obs, info = env.reset()
@@ -305,29 +308,33 @@ def train_both():
     h_opt = optim.Adam(host_rdqn.parameters(), lr=1e-3)
     
     host_buffer = HostReplayBuffer()
-    h_gamma, h_epsilon = 0.99, 1.0
+    h_gamma, h_epsilon = 1.0, 1.0
     h_eps_decay, h_eps_min = 0.995, 0.05
     
     batch_size = 256
     
     # --- 狀態暫存 ---
-    prev_host_curr = None
-    prev_host_hist = None
-    prev_host_action = None
+    prev_host_curr, prev_host_hist, prev_host_action = None, None, None
     last_host_reward = 0.0
 
+    # --- 📊 日誌與統計變數 ---
     episodes = 0
     step = 0
-    episode_p_reward = 0
-    episode_h_reward = 0
+    episode_p_reward, episode_h_reward = 0, 0
+    
+    ep_door_counts = np.zeros(config.num_doors)
+    ep_bribe_sum = 0.0
+    ep_bet_sum = 0.0
+    ep_bribe_steps = 0
+    ep_bet_steps = 0
+    
+    last_bribe_entropy = 0.0
+    last_bet_entropy = 0.0
 
     print("🔥 開始聯合訓練 (Co-Training MARL)...")
 
-    for total_steps in range(1, 1000000): # 無限迴圈或設定一個極大值
+    for total_steps in range(1, 1000000): 
         
-        # ==========================================
-        # Phase 0: 賄賂 (Player Action)
-        # ==========================================
         if env.phase == Phase.BRIBE:
             s1_dict = obs["players"]
             s1_tensor = flatten_obs_player(s1_dict, device)
@@ -336,23 +343,22 @@ def train_both():
                 bribe_frac, _ = player_actor1.sample(s1_tensor)
             
             bribe_action_np = bribe_frac.cpu().numpy().flatten()
+            
+            ep_bribe_sum += np.mean(bribe_action_np)
+            ep_bribe_steps += 1
+            
             obs, _, _, _, info = env.step({"player_bribe_fractions": bribe_action_np})
             r1_np = -env.current_bribes.copy() 
             
-        # ==========================================
-        # Phase 1: 發送訊號 (Host Action)
-        # ==========================================
         elif env.phase == Phase.SIGNAL:
             curr_tensor, hist_tensor = process_host_obs(env, device=device)
             
-            # 將前一局的結果存入 Buffer
             if prev_host_curr is not None:
                 host_buffer.push(
                     prev_host_curr, prev_host_hist, prev_host_action, 
                     last_host_reward, curr_tensor, hist_tensor, done=0
                 )
 
-            # Epsilon-Greedy
             if random.random() < h_epsilon:
                 pub_act = random.randint(0, config.num_doors - 1)
                 priv_acts = [random.randint(0, config.num_doors - 1) for _ in range(config.num_players)]
@@ -372,14 +378,9 @@ def train_both():
             prev_host_action = host_action
             
             obs, _, _, _, info = env.step(host_action)
-
-            # 獲取給 Player 用的 s2
             s2_dict = obs["players"]
             s2_tensor = flatten_obs_player(s2_dict, device)
 
-        # ==========================================
-        # Phase 2: 下注 (Player Action) & 結算 & 網路更新
-        # ==========================================
         elif env.phase == Phase.BET:
             with torch.no_grad():
                 door_idx, door_onehot, bet_frac, _ = player_actor2.sample(s2_tensor)
@@ -387,14 +388,21 @@ def train_both():
             door_idx_np = door_idx.cpu().numpy()
             bet_frac_np = bet_frac.cpu().numpy().flatten()
             
+            ep_bet_sum += np.mean(bet_frac_np)
+            for d in door_idx_np:
+                ep_door_counts[d] += 1
+            ep_bet_steps += 1
+            
             next_obs, rewards, terminated, truncated, info = env.step({
                 "player_doors": door_idx_np,
                 "bet_fractions": bet_frac_np
             })
             step += 1
             
-            # 處理 Reward 與 Next State
-            last_host_reward = rewards["host"]
+            # 🎯 沿用前次修改的 3倍 賄賂獎勵塑形
+            host_bribe_income = np.sum(-r1_np)
+            last_host_reward = rewards["host"] + (2.0 * host_bribe_income)
+            
             total_rewards_np = rewards["players"]
             r2_np = total_rewards_np - r1_np 
             
@@ -413,9 +421,8 @@ def train_both():
             obs = next_obs
             
             # ---------------------------------------------
-            # 【GPU 火力全開】每步都更新神經網路！
+            # 網路優化
             # ---------------------------------------------
-            # 1. 更新 Player SAC
             if player_buffer.size > batch_size * 2:
                 s1, a1, r1, s2, a2_door, a2_bet, r2, s1_next, done = player_buffer.sample(batch_size, device)
                 a2 = torch.cat([a2_door, a2_bet], dim=-1)
@@ -447,7 +454,7 @@ def train_both():
                 q1_loss.backward()
                 p_opt_c1.step()
 
-                # Update Actors
+                # Update Actor 2 (Bet)
                 _, curr_door_onehot, curr_bet_frac, log_pi2 = player_actor2.sample(s2)
                 curr_a2 = torch.cat([curr_door_onehot, curr_bet_frac], dim=-1)
                 q2_pi_a, q2_pi_b = player_critic2(s2, curr_a2)
@@ -455,21 +462,25 @@ def train_both():
                 p_opt_a2.zero_grad()
                 a2_loss.backward()
                 p_opt_a2.step()
+                
+                last_bet_entropy = -log_pi2.mean().item()
 
+                # Update Actor 1 (Bribe)
                 curr_a1, log_pi1 = player_actor1.sample(s1)
                 q1_pi_a, q1_pi_b = player_critic1(s1, curr_a1)
                 a1_loss = (p_alpha * log_pi1 - torch.min(q1_pi_a, q1_pi_b)).mean()
                 p_opt_a1.zero_grad()
                 a1_loss.backward()
                 p_opt_a1.step()
+                
+                last_bribe_entropy = -log_pi1.mean().item()
 
-                # Soft Update
                 for p, tp in zip(player_critic1.parameters(), player_critic1_target.parameters()):
                     tp.data.copy_(p_tau * p.data + (1 - p_tau) * tp.data)
                 for p, tp in zip(player_critic2.parameters(), player_critic2_target.parameters()):
                     tp.data.copy_(p_tau * p.data + (1 - p_tau) * tp.data)
 
-            # 2. 更新 Host RDQN
+            # 更新 Host RDQN
             if len(host_buffer) > batch_size:
                 b_curr, b_hist, b_acts, b_rew, b_ncurr, b_nhist, b_done = host_buffer.sample(batch_size, device)
                 
@@ -494,9 +505,6 @@ def train_both():
                 for p, tp in zip(host_rdqn.parameters(), host_target_rdqn.parameters()):
                     tp.data.copy_(0.005 * p.data + 0.995 * tp.data)
 
-            # ==========================================
-            # Episode 結束處理 & 存檔
-            # ==========================================
             if terminated or truncated:
                 if prev_host_curr is not None:
                     curr_tensor, hist_tensor = process_host_obs(env, device=device)
@@ -509,9 +517,19 @@ def train_both():
                 h_epsilon = max(h_eps_min, h_epsilon * h_eps_decay)
                 episodes += 1
                 
-                print(f"✅ Ep {episodes:4d} | Player Avg Reward: {episode_p_reward/step:.2f} | Host Total Profit: {episode_h_reward:.2f} | Host Eps: {h_epsilon:.3f}")
+                total_doors = np.sum(ep_door_counts) + 1e-6
+                door_pct = (ep_door_counts / total_doors) * 100
+                avg_bribe = ep_bribe_sum / max(1, ep_bribe_steps)
+                avg_bet = ep_bet_sum / max(1, ep_bet_steps)
                 
-                # 每 100 個 Episode 存檔
+                # 🎯 【關鍵修改】日誌改為只印 A, B, C 門
+                print(f"✅ Ep {episodes:4d} | P_Reward: {episode_p_reward/step:+.2f} | H_Profit: {episode_h_reward:+.2f} | H_Eps: {h_epsilon:.3f}")
+                print(f"   📊 [Action ] Avg Bribe: {avg_bribe:.3f} | Avg Bet: {avg_bet:.3f}")
+                door_str = " | ".join([f"{chr(65+i)}: {door_pct[i]:5.1f}%" for i in range(config.num_doors)])
+                print(f"   🚪 [Doors  ] {door_str}")
+                print(f"   🌀 [Entropy] Bribe Ent: {last_bribe_entropy:.3f} | Bet/Door Ent: {last_bet_entropy:.3f}")
+                print("-" * 60)
+                
                 if episodes % 100 == 0:
                     save_path = os.path.join(checkpoint_dir, f"marl_checkpoint_ep_{episodes}.pth")
                     torch.save({
@@ -524,8 +542,11 @@ def train_both():
 
                 obs, info = env.reset()
                 step = 0
-                episode_p_reward = 0
-                episode_h_reward = 0
+                episode_p_reward, episode_h_reward = 0, 0
+                
+                ep_door_counts.fill(0)
+                ep_bribe_sum, ep_bet_sum = 0.0, 0.0
+                ep_bribe_steps, ep_bet_steps = 0, 0
 
 if __name__ == "__main__":
     train_both()

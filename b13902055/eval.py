@@ -99,13 +99,14 @@ if __name__ == "__main__":
     console = Console()
     
     # 這裡填入你剛剛訓練完的 checkpoint 路徑
-    CHECKPOINT_PATH = "checkpoints/marl_checkpoint_ep_400.pth" 
+    CHECKPOINT_PATH = "checkpoints/marl_checkpoint_ep_500.pth" 
     
     config = OracleGambitConfig(
         num_players=10, 
-        num_doors=4, 
+        num_doors=3, 
         max_rounds=20, # Eval 時可以先看 20 局 
         initial_balance=1000.0,
+        
     )
     env = OracleGambitEnv(config=config, seed=42)
     obs, info = env.reset()
