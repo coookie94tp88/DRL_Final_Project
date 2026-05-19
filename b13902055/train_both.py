@@ -337,12 +337,13 @@ def train_both(
     player_sac_alpha = 0.10
     h_eps_decay = 0.9995
     grad_clip_norm = 1.0
-    loop_iter_multiplier = 4  # BRIBE→SIGNAL→BET plus occasional extra transitions at episode boundaries.
-    max_loop_iters = total_bet_steps * loop_iter_multiplier
+    phases_per_round_estimate = 4  # BRIBE→SIGNAL→BET plus occasional extra transitions at episode boundaries.
+    max_loop_iters = total_bet_steps * phases_per_round_estimate
     player_truth_follow_bonus = 0.25
     player_false_follow_penalty = 0.12
     player_crowding_penalty = 0.08
     host_bribe_signal_coupling_bonus = 0.5
+    epsilon_stability = 1e-6
 
     player_actor1 = BribeActor(
         num_doors=config.num_doors,
@@ -499,7 +500,7 @@ def train_both(
             private_is_truth = (last_private_signals == winning_door).astype(np.float32)
             bribe_weights = np.maximum(-r1_np, 0.0).astype(np.float32)
             weighted_truth = float(
-                np.sum(bribe_weights * private_is_truth) / (np.sum(bribe_weights) + 1e-6)
+                np.sum(bribe_weights * private_is_truth) / (np.sum(bribe_weights) + epsilon_stability)
             )
             last_host_reward = (
                 float(rewards["host"])
@@ -643,7 +644,7 @@ def train_both(
                 h_epsilon = max(h_eps_min, h_epsilon * h_eps_decay)
                 episodes += 1
 
-                total_doors = np.sum(ep_door_counts) + 1e-6
+                total_doors = np.sum(ep_door_counts) + epsilon_stability
                 door_pct = (ep_door_counts / total_doors) * 100.0
                 avg_bribe = ep_bribe_mean_sum / max(1, ep_bribe_steps)
                 avg_bet = ep_bet_mean_sum / max(1, ep_bet_steps)
