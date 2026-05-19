@@ -337,7 +337,12 @@ def train_both(
     player_sac_alpha = 0.10
     h_eps_decay = 0.9995
     grad_clip_norm = 1.0
-    max_loop_iters = total_bet_steps * 4
+    loop_iter_multiplier = 4  # BRIBE→SIGNAL→BET plus occasional extra transitions at episode boundaries.
+    max_loop_iters = total_bet_steps * loop_iter_multiplier
+    player_truth_follow_bonus = 0.25
+    player_false_follow_penalty = 0.12
+    player_crowding_penalty = 0.08
+    host_bribe_signal_coupling_bonus = 0.5
 
     player_actor1 = BribeActor(
         num_doors=config.num_doors,
@@ -394,6 +399,7 @@ def train_both(
     ep_bet_steps = 0
     ep_door_counts = np.zeros(config.num_doors, dtype=np.float64)
     ep_priv_truth_rate_sum = 0.0
+    ep_priv_follow_rate_sum = 0.0
     ep_signal_steps = 0
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -401,13 +407,15 @@ def train_both(
     os.makedirs(out_dir, exist_ok=True)
 
     print("🔥 Start co-training (player SAC + host RDQN)")
+    last_private_signals = np.zeros(config.num_players, dtype=np.int32)
 
     loop_iters = 0
     while bet_steps < total_bet_steps:
         loop_iters += 1
         if loop_iters > max_loop_iters:
             raise RuntimeError(
-                "Training loop exceeded safety iteration cap before reaching target bet steps."
+                f"Training loop exceeded safety cap ({loop_iters} > {max_loop_iters}) "
+                f"after {bet_steps} bet steps."
             )
         if env.phase == Phase.BRIBE:
             s1_dict = obs["players"]
@@ -450,6 +458,7 @@ def train_both(
                 "public_signal": pub_act,
                 "private_signals": np.array(priv_acts, dtype=np.int32),
             }
+            last_private_signals = host_action["private_signals"].copy()
             prev_host_curr = curr_tensor
             prev_host_hist = hist_tensor
             prev_host_action = host_action
@@ -475,7 +484,7 @@ def train_both(
             for d in door_idx_np:
                 ep_door_counts[int(d)] += 1
 
-            next_obs, rewards, terminated, truncated, _ = env.step(
+            next_obs, rewards, terminated, truncated, info = env.step(
                 {
                     "player_doors": door_idx_np,
                     "bet_fractions": bet_frac_np,
@@ -486,10 +495,32 @@ def train_both(
             round_in_ep += 1
 
             host_bribe_income = float(np.sum(-r1_np))
-            last_host_reward = float(rewards["host"]) + 2.0 * host_bribe_income
+            winning_door = int(info["winning_door"])
+            private_is_truth = (last_private_signals == winning_door).astype(np.float32)
+            bribe_weights = np.maximum(-r1_np, 0.0).astype(np.float32)
+            weighted_truth = float(
+                np.sum(bribe_weights * private_is_truth) / (np.sum(bribe_weights) + 1e-6)
+            )
+            last_host_reward = (
+                float(rewards["host"])
+                + 2.0 * host_bribe_income
+                + host_bribe_signal_coupling_bonus * weighted_truth
+            )
 
             total_rewards_np = rewards["players"]
-            r2_np = total_rewards_np - r1_np
+            follow_private = (door_idx_np == last_private_signals).astype(np.float32)
+            ep_priv_follow_rate_sum += float(np.mean(follow_private))
+            truth_follow_bonus = player_truth_follow_bonus * (private_is_truth * follow_private)
+            false_follow_penalty = player_false_follow_penalty * ((1.0 - private_is_truth) * follow_private)
+            door_ratios = env.hist_door_ratios[-1]
+            chosen_door_ratios = np.array([door_ratios[d] for d in door_idx_np], dtype=np.float32)
+            shaped_player_rewards = (
+                total_rewards_np
+                + truth_follow_bonus
+                - false_follow_penalty
+                - player_crowding_penalty * chosen_door_ratios
+            )
+            r2_np = shaped_player_rewards - r1_np
 
             s1_next_dict = next_obs["players"]
             s1_next_tensor = flatten_obs_player(s1_next_dict, device)
@@ -508,7 +539,7 @@ def train_both(
                 done_arr,
             )
 
-            ep_player_reward_sum += float(np.mean(total_rewards_np))
+            ep_player_reward_sum += float(np.mean(shaped_player_rewards))
             ep_host_reward_sum += last_host_reward
             obs = next_obs
 
@@ -534,7 +565,7 @@ def train_both(
                     next_a2 = torch.cat([next_door_onehot, next_bet_frac], dim=-1)
                     target_q2_a, target_q2_b = player_critic2_target(s2, next_a2)
                     target_v2 = torch.min(target_q2_a, target_q2_b) - player_sac_alpha * next_log_pi2
-                    target_q1 = r1 + p_gamma * (1 - done) * target_v2
+                    target_q1 = r1 + p_gamma * target_v2
 
                 current_q1_a, current_q1_b = player_critic1(s1, a1)
                 q1_loss = F.mse_loss(current_q1_a, target_q1) + F.mse_loss(current_q1_b, target_q1)
@@ -569,14 +600,15 @@ def train_both(
                 b_curr, b_hist, b_acts, b_rew, b_ncurr, b_nhist, b_done = host_buffer.sample(batch_size, device)
 
                 b_act_pub = torch.tensor([a["public_signal"] for a in b_acts], dtype=torch.long, device=device).view(-1, 1)
-                b_act_privs = [
-                    torch.tensor([a["private_signals"][i] for a in b_acts], dtype=torch.long, device=device).view(-1, 1)
-                    for i in range(config.num_players)
-                ]
+                priv_matrix = np.stack([a["private_signals"] for a in b_acts], axis=0)
+                b_act_privs = torch.as_tensor(priv_matrix, dtype=torch.long, device=device)
 
                 q_pub, q_privs = host_rdqn(b_curr, b_hist)
                 q_pub_val = q_pub.gather(1, b_act_pub)
-                q_priv_vals = sum(q_privs[i].gather(1, b_act_privs[i]) for i in range(config.num_players))
+                q_priv_vals = sum(
+                    q_privs[i].gather(1, b_act_privs[:, i].view(-1, 1))
+                    for i in range(config.num_players)
+                )
                 total_q = q_pub_val + q_priv_vals
 
                 with torch.no_grad():
@@ -616,6 +648,7 @@ def train_both(
                 avg_bribe = ep_bribe_mean_sum / max(1, ep_bribe_steps)
                 avg_bet = ep_bet_mean_sum / max(1, ep_bet_steps)
                 avg_priv_truth = ep_priv_truth_rate_sum / max(1, ep_signal_steps)
+                avg_priv_follow = ep_priv_follow_rate_sum / max(1, ep_signal_steps)
                 avg_player_reward = ep_player_reward_sum / max(1, round_in_ep)
 
                 door_str = " | ".join(
@@ -628,7 +661,7 @@ def train_both(
                 )
                 print(
                     f"   📊 Avg BribeFrac: {avg_bribe:.3f} | Avg BetFrac: {avg_bet:.3f} | "
-                    f"PrivTruth: {avg_priv_truth:.3f}"
+                    f"PrivTruth: {avg_priv_truth:.3f} | PrivFollow: {avg_priv_follow:.3f}"
                 )
                 print(f"   🚪 Doors: {door_str}")
                 print("-" * 70)
@@ -654,6 +687,7 @@ def train_both(
                 ep_bet_steps = 0
                 ep_signal_steps = 0
                 ep_priv_truth_rate_sum = 0.0
+                ep_priv_follow_rate_sum = 0.0
                 ep_door_counts.fill(0.0)
 
     player_path, host_path = save_separate_models(
