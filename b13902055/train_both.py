@@ -1,3 +1,4 @@
+import argparse
 import copy
 import os
 import random
@@ -313,6 +314,7 @@ def train_both(
     total_bet_steps=120000,
     batch_size=256,
     save_every_episodes=50,
+    num_doors=4,
 ):
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -320,7 +322,7 @@ def train_both(
 
     config = OracleGambitConfig(
         num_players=10,
-        num_doors=4,
+        num_doors=num_doors,
         max_rounds=250,
         initial_balance=1000.0,
         history_window=50,
@@ -703,4 +705,17 @@ def train_both(
 
 
 if __name__ == "__main__":
-    train_both()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--num-doors", type=int, default=4, help="Door count for training (e.g., 3 or 4)")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--total-bet-steps", type=int, default=120000)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--save-every-episodes", type=int, default=50)
+    args = parser.parse_args()
+    train_both(
+        seed=args.seed,
+        total_bet_steps=args.total_bet_steps,
+        batch_size=args.batch_size,
+        save_every_episodes=args.save_every_episodes,
+        num_doors=args.num_doors,
+    )
