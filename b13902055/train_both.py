@@ -85,9 +85,11 @@ class TransformerExtractor(nn.Module):
 
 
 class BribeActor(nn.Module):
-    def __init__(self, num_doors=4):
+    def __init__(self, num_doors=4, log_std_min=-5.0, log_std_max=1.0):
         super().__init__()
         self.num_doors = num_doors
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
         curr_dim = 2 * num_doors + 5
         hist_dim = 4 * num_doors + 7
         self.extractor = TransformerExtractor(curr_dim=curr_dim, hist_dim=hist_dim)
@@ -98,7 +100,7 @@ class BribeActor(nn.Module):
         curr_enc, hist_enc = encode_features(state_flat, num_doors=self.num_doors)
         feat = self.extractor(curr_enc, hist_enc)
         mu = self.mu_layer(feat)
-        log_std = torch.clamp(self.log_std_layer(feat), -5.0, 1.0)
+        log_std = torch.clamp(self.log_std_layer(feat), self.log_std_min, self.log_std_max)
         return mu, log_std
 
     def sample(self, state_flat):
@@ -112,9 +114,12 @@ class BribeActor(nn.Module):
 
 
 class BetActor(nn.Module):
-    def __init__(self, num_doors=4):
+    def __init__(self, num_doors=4, gumbel_tau=0.8, log_std_min=-5.0, log_std_max=1.0):
         super().__init__()
         self.num_doors = num_doors
+        self.gumbel_tau = gumbel_tau
+        self.log_std_min = log_std_min
+        self.log_std_max = log_std_max
         curr_dim = 2 * num_doors + 5
         hist_dim = 4 * num_doors + 7
         self.extractor = TransformerExtractor(curr_dim=curr_dim, hist_dim=hist_dim)
@@ -127,7 +132,7 @@ class BetActor(nn.Module):
         feat = self.extractor(curr_enc, hist_enc)
 
         door_logits = self.door_logits_layer(feat)
-        door_one_hot = F.gumbel_softmax(door_logits, tau=0.8, hard=True)
+        door_one_hot = F.gumbel_softmax(door_logits, tau=self.gumbel_tau, hard=True)
         door_probs = F.softmax(door_logits, dim=-1)
         log_prob_door = torch.sum(
             torch.log(door_probs + 1e-8) * door_one_hot, dim=-1, keepdim=True
@@ -135,7 +140,7 @@ class BetActor(nn.Module):
         door_idx = door_one_hot.argmax(dim=-1)
 
         bet_mu = self.bet_mu_layer(feat)
-        bet_log_std = torch.clamp(self.bet_log_std_layer(feat), -5.0, 1.0)
+        bet_log_std = torch.clamp(self.bet_log_std_layer(feat), self.log_std_min, self.log_std_max)
         bet_dist = Normal(bet_mu, bet_log_std.exp())
         x_t = bet_dist.rsample()
         bet_fraction = torch.sigmoid(x_t)
@@ -324,11 +329,28 @@ def train_both(
 
     state_dim = config.current_player_dim + config.history_window * config.hist_player_dim
 
-    player_actor1 = BribeActor(num_doors=config.num_doors).to(device)
+    # Exploration/stability hyperparameters are explicit so they can be tuned easily.
+    # Narrower std range and slightly lower Gumbel tau reduce random-collapse behavior.
+    bribe_log_std_min, bribe_log_std_max = -5.0, 1.0
+    bet_log_std_min, bet_log_std_max = -5.0, 1.0
+    bet_gumbel_tau = 0.8
+    p_alpha = 0.10
+    h_eps_decay = 0.9995
+
+    player_actor1 = BribeActor(
+        num_doors=config.num_doors,
+        log_std_min=bribe_log_std_min,
+        log_std_max=bribe_log_std_max,
+    ).to(device)
     player_critic1 = Critic(action_dim=1, num_doors=config.num_doors).to(device)
     player_critic1_target = copy.deepcopy(player_critic1)
 
-    player_actor2 = BetActor(num_doors=config.num_doors).to(device)
+    player_actor2 = BetActor(
+        num_doors=config.num_doors,
+        gumbel_tau=bet_gumbel_tau,
+        log_std_min=bet_log_std_min,
+        log_std_max=bet_log_std_max,
+    ).to(device)
     player_critic2 = Critic(action_dim=config.num_doors + 1, num_doors=config.num_doors).to(device)
     player_critic2_target = copy.deepcopy(player_critic2)
 
@@ -338,7 +360,7 @@ def train_both(
     p_opt_c2 = optim.Adam(player_critic2.parameters(), lr=3e-4)
 
     player_buffer = TwoStepReplayBuffer(max_size=100000, state_dim=state_dim, num_doors=config.num_doors)
-    p_gamma, p_tau, p_alpha = 0.99, 0.005, 0.10
+    p_gamma, p_tau = 0.99, 0.005
 
     obs, _ = env.reset()
     host_hist_dim = obs["host"]["history"].shape[1]
@@ -353,7 +375,7 @@ def train_both(
 
     host_buffer = HostReplayBuffer()
     h_gamma, h_epsilon = 0.99, 1.0
-    h_eps_decay, h_eps_min = 0.9995, 0.05
+    h_eps_min = 0.05
 
     prev_host_curr, prev_host_hist, prev_host_action = None, None, None
     last_host_reward = 0.0
