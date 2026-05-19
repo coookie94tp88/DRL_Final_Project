@@ -499,13 +499,13 @@ def train_both(
             winning_door = int(info["winning_door"])
             private_is_truth = (last_private_signals == winning_door).astype(np.float32)
             bribe_weights = np.maximum(-r1_np, 0.0).astype(np.float32)
-            weighted_truth = float(
+            bribe_weighted_truth_rate = float(
                 np.sum(bribe_weights * private_is_truth) / (np.sum(bribe_weights) + epsilon_stability)
             )
             last_host_reward = (
                 float(rewards["host"])
                 + 2.0 * host_bribe_income
-                + host_bribe_signal_coupling_bonus * weighted_truth
+                + host_bribe_signal_coupling_bonus * bribe_weighted_truth_rate
             )
 
             total_rewards_np = rewards["players"]
