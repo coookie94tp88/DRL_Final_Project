@@ -98,8 +98,9 @@ def render_round_log(console: Console, env: OracleGambitEnv, rewards: dict, info
 if __name__ == "__main__":
     console = Console()
     
-    # 這裡填入你剛剛訓練完的 checkpoint 路徑
-    CHECKPOINT_PATH = "checkpoints/marl_checkpoint_ep_500.pth" 
+    # 這裡填入你剛剛訓練完的 checkpoint 路徑（分開儲存）
+    PLAYER_PATH = "checkpoints/player.pth"
+    HOST_PATH = "checkpoints/host.pth"
     
     config = OracleGambitConfig(
         num_players=10, 
@@ -114,10 +115,10 @@ if __name__ == "__main__":
     # 動態獲取 hist_dim 以確保網路輸入維度一致
     hist_dim = obs["host"]["history"].shape[1]
     
-    # 初始化雙方 Agent (都從同一個 checkpoint 讀取)
+    # 初始化雙方 Agent（分開讀取 player.pth / host.pth）
     console.print("[bold yellow]載入 MARL Agents...[/bold yellow]")
-    player_agent = TrainedPlayerAgent(CHECKPOINT_PATH, config, device="cuda") 
-    host_agent = TrainedHostAgent(CHECKPOINT_PATH, config, hist_dim=hist_dim, device="cuda")
+    player_agent = TrainedPlayerAgent(PLAYER_PATH, num_doors=config.num_doors, device="cuda")
+    host_agent = TrainedHostAgent(HOST_PATH, config, hist_dim=hist_dim, device="cuda")
     
     console.print(Panel(
         "OracleGambit - AI vs AI Evaluation\n"
