@@ -146,25 +146,22 @@ def run_episodes(
             phase_before = env._phase
             obs, rewards, terms, _, _ = env.step(actions)
             done = all(terms.values())
-            # log on settlement (after PHASE_BET)
-            if phase_before == PHASE_BET:
-                # last round just settled; pull from env.stats / history
-                if env.stats.rounds_played > 0:
-                    last_x = env.stats.x_values[-1] if env.stats.x_values else 0.0
-                    # door_share from last history row
-                    last_row = env._history[-1]
-                    door_share = last_row[12:16].copy()
-                    acc.add_round(
-                        r_host=rewards["host"],
-                        bribe_pcts=env._round_bribe_pcts.tolist(),
-                        x=last_x,
-                        door_share=door_share,
-                        private_signals=env._round_private_signals.tolist(),
-                        public_signal=int(env._round_public_signal),
-                        true_door=int(env._round_true_door),
-                        chosen_doors=env._last_chosen_doors.tolist(),
-                        active_mask=env._active.tolist(),
-                    )
+            # Log the round that just settled. After BET, env.step() already called
+            # _start_new_round(), so _round_* fields are the *next* round — use
+            # last_settlement (same as doorl.watch / training_watch).
+            if phase_before == PHASE_BET and env.last_settlement is not None:
+                s = env.last_settlement
+                acc.add_round(
+                    r_host=float(s.reward_host),
+                    bribe_pcts=s.bribe_pcts.tolist(),
+                    x=float(s.x) if s.pool_p > 0.0 else None,
+                    door_share=s.door_share.copy(),
+                    private_signals=s.private_signals.tolist(),
+                    public_signal=int(s.public_signal),
+                    true_door=int(s.true_door),
+                    chosen_doors=s.chosen_doors.tolist(),
+                    active_mask=(s.bets >= env.cfg.min_bet).astype(np.float64).tolist(),
+                )
         acc.add_end_of_episode(env._balances.tolist(), env._active.tolist())
     return acc.finalize()
 
@@ -178,8 +175,18 @@ def main() -> None:
     p.add_argument("--config", default="config/default.yaml")
     p.add_argument("--episodes", type=int, default=50)
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--baseline", default=None,
-                   help="Baseline name: random_host, truthful_host, noisy_truthful_host, greedy_players, no_bribe_players")
+    p.add_argument(
+        "--baseline",
+        default=None,
+        help="Host baseline: random_host, truthful_host, noisy_truthful_host; "
+        "or player-only: greedy_players, no_bribe_players",
+    )
+    p.add_argument(
+        "--player-baseline",
+        default=None,
+        help="Optional player baseline (combine with --baseline truthful_host): "
+        "greedy_players, no_bribe_players",
+    )
     p.add_argument(
         "--player-ckpt",
         default=None,
@@ -264,15 +271,24 @@ def main() -> None:
     elif name is not None:
         raise ValueError(f"Unknown baseline {name!r}")
 
-    use_learned = has_learned and host_baseline is None and player_baseline is None
+    pb_name = args.player_baseline
+    if pb_name == "greedy_players":
+        player_baseline = GreedyPlayer()
+    elif pb_name == "no_bribe_players":
+        player_baseline = NoBribePlayer()
+    elif pb_name is not None:
+        raise ValueError(f"Unknown player baseline {pb_name!r}")
+
+    use_player_policy = has_learned and player_baseline is None
+    use_host_policy = has_learned and host_baseline is None
 
     if args.watch:
         from doorl.watch import watch_episode
 
         watch_episode(
             cfg,
-            player_policy=player if use_learned else None,
-            host_policy=host if use_learned else None,
+            player_policy=player if use_player_policy else None,
+            host_policy=host if use_host_policy else None,
             host_baseline=host_baseline,
             player_baseline=player_baseline,
             seed=args.seed,
@@ -284,8 +300,8 @@ def main() -> None:
 
     summary = run_episodes(
         cfg,
-        player_policy=player if use_learned else None,
-        host_policy=host if use_learned else None,
+        player_policy=player if use_player_policy else None,
+        host_policy=host if use_host_policy else None,
         host_baseline=host_baseline,
         player_baseline=player_baseline,
         episodes=args.episodes,
@@ -306,6 +322,7 @@ def main() -> None:
                 "num_players": cfg["env"]["num_players"],
                 "max_rounds": cfg["env"]["max_rounds"],
                 "baseline": name,
+                "player_baseline": pb_name,
                 "cross_play": cross_play,
                 "player_ckpt": args.player_ckpt or args.ckpt,
                 "host_ckpt": args.host_ckpt or args.ckpt,

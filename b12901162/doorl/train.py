@@ -22,6 +22,13 @@ import torch
 import yaml
 
 from doorl import parallel_env
+from doorl.baselines import (
+    GreedyPlayer,
+    NoBribePlayer,
+    NoisyTruthfulHost,
+    RandomHost,
+    TruthfulHost,
+)
 from doorl.checkpoint_utils import load_checkpoint, save_checkpoint
 from doorl.config_utils import load_config
 from doorl.happo import HAPPOTrainer, TrainConfig
@@ -109,8 +116,28 @@ def _build_train_cfg(cfg: Dict[str, Any]) -> TrainConfig:
         reward_norm_clip=float(t.get("reward_norm_clip", 10.0)),
         log_ratio_clip=float(t.get("log_ratio_clip", 20.0)),
         max_beta_concentration=float(t.get("max_beta_concentration", 100.0)),
+        freeze_host=bool(t.get("freeze_host", False)),
+        freeze_players=bool(t.get("freeze_players", False)),
         anti_babbling=dict(t.get("anti_babbling", {})),
     )
+
+
+def _make_host_baseline(name: str, num_players: int, seed: int):
+    if name == "random_host":
+        return RandomHost(num_players, seed=seed)
+    if name == "truthful_host":
+        return TruthfulHost(num_players, seed=seed)
+    if name == "noisy_truthful_host":
+        return NoisyTruthfulHost(num_players, seed=seed)
+    raise ValueError(f"Unknown host baseline {name!r}")
+
+
+def _make_player_baseline(name: str):
+    if name == "greedy_players":
+        return GreedyPlayer()
+    if name == "no_bribe_players":
+        return NoBribePlayer()
+    raise ValueError(f"Unknown player baseline {name!r}")
 
 
 class _StdoutLogger:
@@ -190,6 +217,31 @@ def main() -> None:
         default=None,
         help="Path to checkpoint (e.g. runs/myrun/ckpt/latest.pt) to continue training",
     )
+    p.add_argument(
+        "--host-baseline",
+        default=None,
+        help="Fixed host during rollout: random_host, truthful_host, noisy_truthful_host",
+    )
+    p.add_argument(
+        "--player-baseline",
+        default=None,
+        help="Fixed players during rollout: greedy_players, no_bribe_players",
+    )
+    p.add_argument(
+        "--freeze-host",
+        action="store_true",
+        help="Do not PPO-update the host (use with --host-baseline or a pretrained host)",
+    )
+    p.add_argument(
+        "--freeze-players",
+        action="store_true",
+        help="Do not PPO-update players (use with --player-baseline or --resume)",
+    )
+    p.add_argument(
+        "--init-players",
+        default=None,
+        help="Load player weights only (e.g. from doorl.bc_pretrain) before training",
+    )
     args = p.parse_args()
 
     cfg = load_config(args.config, overrides=args.override)
@@ -209,9 +261,43 @@ def main() -> None:
     _set_seed(seed)
 
     player, host, _env = _build_models(cfg)
+    if args.init_players:
+        if args.resume:
+            print("warning: --init-players ignored because --resume is set", flush=True)
+        else:
+            ck = torch.load(
+                args.init_players, map_location=args.device, weights_only=False
+            )
+            player.load_state_dict(ck["player"])
+            print(f"loaded player weights from {args.init_players}", flush=True)
     tcfg = _build_train_cfg(cfg)
+    if args.freeze_host:
+        tcfg.freeze_host = True
+    if args.freeze_players:
+        tcfg.freeze_players = True
     factory = _build_env_factory(cfg)
     total_iters = max(1, tcfg.total_timesteps // tcfg.n_steps)
+
+    host_bl = (
+        _make_host_baseline(args.host_baseline, _env.num_players, seed)
+        if args.host_baseline
+        else None
+    )
+    player_bl = (
+        _make_player_baseline(args.player_baseline) if args.player_baseline else None
+    )
+    if host_bl is not None and not tcfg.freeze_host:
+        print(
+            "note: --host-baseline set; enabling --freeze-host (host is scripted)",
+            flush=True,
+        )
+        tcfg.freeze_host = True
+    if player_bl is not None and not tcfg.freeze_players:
+        print(
+            "note: --player-baseline set; enabling --freeze-players",
+            flush=True,
+        )
+        tcfg.freeze_players = True
 
     start_iter = 0
     initial_step = 0
@@ -223,6 +309,8 @@ def main() -> None:
         cfg=tcfg,
         device=args.device,
         logger=None,
+        host_baseline=host_bl,
+        player_baseline=player_bl,
     )
 
     if args.resume:

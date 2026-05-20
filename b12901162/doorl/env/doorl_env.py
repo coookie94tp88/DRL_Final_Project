@@ -410,6 +410,20 @@ class DooRLEnv:
         self._balances += payouts
 
         rewards_player = (payouts - bets - self._round_bribes).astype(np.float32)
+        pub_bonus = float(self.cfg.follow_public_bonus)
+        priv_bonus = float(self.cfg.follow_private_bonus)
+        if pub_bonus > 0.0 or priv_bonus > 0.0:
+            for i in range(self.num_players):
+                if self._active[i] == 0.0 or bets[i] <= 0.0:
+                    continue
+                if pub_bonus > 0.0 and int(chosen_doors[i]) == int(
+                    self._round_public_signal
+                ):
+                    rewards_player[i] += pub_bonus
+                if priv_bonus > 0.0 and int(chosen_doors[i]) == int(
+                    self._round_private_signals[i]
+                ):
+                    rewards_player[i] += priv_bonus
         host_pool_pnl = P - float(payouts.sum())
         reward_host = float(host_pool_pnl + self._round_host_bribe_tally)
 

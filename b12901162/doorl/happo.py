@@ -65,6 +65,8 @@ class TrainConfig:
     reward_norm_clip: float = 10.0
     log_ratio_clip: float = 20.0
     max_beta_concentration: float = 100.0
+    freeze_host: bool = False
+    freeze_players: bool = False
 
     # anti-babbling (read by trainer when wrapping policies)
     anti_babbling: Dict[str, Any] = field(default_factory=dict)
@@ -82,10 +84,14 @@ class HAPPOTrainer:
         cfg: TrainConfig,
         device: str = "cpu",
         logger: Optional[Callable[[int, Dict[str, float]], None]] = None,
+        host_baseline: Optional[Any] = None,
+        player_baseline: Optional[Any] = None,
     ) -> None:
         self.env = env_factory()
         self.player_policy = player_policy.to(device)
         self.host_policy = host_policy.to(device)
+        self.host_baseline = host_baseline
+        self.player_baseline = player_baseline
         self.cfg = cfg
         self.device = torch.device(device)
         self.logger = logger
@@ -122,6 +128,8 @@ class HAPPOTrainer:
             done = float(all(terms.values()))
 
             for a in self.agent_names:
+                if a != "host" and phase == PHASE_HOST:
+                    continue
                 traj[a].add(
                     obs=obs[a],
                     action=actions[a],
@@ -147,42 +155,65 @@ class HAPPOTrainer:
         actions: Dict[str, dict] = {}
         infos: Dict[str, dict] = {}
 
-        # host
-        host_obs_t = torch.tensor(
-            obs["host"], dtype=torch.float32, device=self.device
-        ).unsqueeze(0)
-        host_action, host_info = self.host_policy.act(host_obs_t, deterministic=False)
-        actions["host"] = {
-            "public_door": int(host_action["public_door"][0]),
-            "private_logits": host_action["private_logits"][0],
-        }
-        infos["host"] = {
-            "logp": {"logp_public": host_info["logp_public"]},
-            "value": float(host_info["value"][0]),
-        }
+        env = self.env
 
-        # players
-        for i, name in enumerate(self.player_names):
-            o_t = torch.tensor(
-                obs[name], dtype=torch.float32, device=self.device
+        # host
+        if self.host_baseline is not None:
+            actions["host"] = self.host_baseline.act(env, obs)
+            infos["host"] = {
+                "logp": {"logp_public": torch.tensor(0.0, device=self.device)},
+                "value": 0.0,
+            }
+        else:
+            host_obs_t = torch.tensor(
+                obs["host"], dtype=torch.float32, device=self.device
             ).unsqueeze(0)
-            idx_t = torch.tensor([i], dtype=torch.long, device=self.device)
-            act, info = self.player_policy.act(o_t, idx_t, phase=phase)
-            actions[name] = {
-                "bribe_pct": np.array(act["bribe_pct"][0], dtype=np.float32).reshape(
-                    -1
-                ),
-                "door": int(act["door"][0]),
-                "bet_pct": np.array(act["bet_pct"][0], dtype=np.float32).reshape(-1),
+            host_action, host_info = self.host_policy.act(
+                host_obs_t, deterministic=False
+            )
+            actions["host"] = {
+                "public_door": int(host_action["public_door"][0]),
+                "private_logits": host_action["private_logits"][0],
             }
-            infos[name] = {
-                "logp": {
-                    "logp_bribe": info["logp_bribe"],
-                    "logp_door": info["logp_door"],
-                    "logp_bet": info["logp_bet"],
-                },
-                "value": float(info["value"][0]),
+            infos["host"] = {
+                "logp": {"logp_public": host_info["logp_public"]},
+                "value": float(host_info["value"][0]),
             }
+
+        # players (no action while host is signaling)
+        if phase == PHASE_HOST:
+            for i, name in enumerate(self.player_names):
+                actions[name] = {
+                    "bribe_pct": np.array([0.0], dtype=np.float32),
+                    "door": 0,
+                    "bet_pct": np.array([0.0], dtype=np.float32),
+                }
+            return actions, infos
+
+        for i, name in enumerate(self.player_names):
+            if self.player_baseline is not None:
+                actions[name] = self.player_baseline.act(env, obs, i, phase)
+                lp = torch.tensor(0.0, device=self.device)
+                infos[name] = {"logp": lp, "value": 0.0}
+            else:
+                o_t = torch.tensor(
+                    obs[name], dtype=torch.float32, device=self.device
+                ).unsqueeze(0)
+                idx_t = torch.tensor([i], dtype=torch.long, device=self.device)
+                act, info = self.player_policy.act(o_t, idx_t, phase=phase)
+                actions[name] = {
+                    "bribe_pct": np.array(
+                        act["bribe_pct"][0], dtype=np.float32
+                    ).reshape(-1),
+                    "door": int(act["door"][0]),
+                    "bet_pct": np.array(act["bet_pct"][0], dtype=np.float32).reshape(
+                        -1
+                    ),
+                }
+                infos[name] = {
+                    "logp": info["logp"],
+                    "value": float(info["value"][0]),
+                }
         return actions, infos
 
     # ------------------------- update --------------------------
@@ -214,8 +245,12 @@ class HAPPOTrainer:
             adv = normalize_advantages(adv, clip=cfg.adv_clip)
 
             if agent == "host":
+                if cfg.freeze_host:
+                    continue
                 m = self._update_host(t, adv, returns)
             else:
+                if cfg.freeze_players:
+                    continue
                 idx = self.player_names.index(agent)
                 m = self._update_player(idx, t, adv, returns)
             for k, v in m.items():
@@ -224,6 +259,14 @@ class HAPPOTrainer:
 
     def _tensor(self, x, dtype=torch.float32):
         return torch.as_tensor(x, dtype=dtype, device=self.device)
+
+    def _legacy_player_logp(self, logps: dict, phase: int) -> torch.Tensor:
+        """Backward-compatible logp from pre-phase-aware rollouts."""
+        if phase == PHASE_BRIBE and "logp_bribe" in logps:
+            return logps["logp_bribe"].view(-1)
+        if phase == PHASE_BET and "logp_door" in logps:
+            return (logps["logp_door"] + logps["logp_bet"]).view(-1)
+        return torch.zeros(1, device=self.device)
 
     def _update_player(
         self,
@@ -249,11 +292,18 @@ class HAPPOTrainer:
         )
         actions = {"bribe_pct": bribe, "door": door, "bet_pct": bet}
 
-        old_logp = (
-            torch.cat([t["logp_bribe"].view(1) for t in traj.logp_components])
-            + torch.cat([t["logp_door"].view(1) for t in traj.logp_components])
-            + torch.cat([t["logp_bet"].view(1) for t in traj.logp_components])
-        ).to(self.device)
+        phases_t = torch.tensor(traj.phases, dtype=torch.long, device=self.device)
+        old_parts = []
+        for i, t in enumerate(traj.logp_components):
+            if isinstance(t, torch.Tensor):
+                old_parts.append(t.reshape(-1))
+            elif isinstance(t, dict) and isinstance(t.get("logp"), torch.Tensor):
+                old_parts.append(t["logp"].reshape(-1))
+            else:
+                old_parts.append(
+                    self._legacy_player_logp(t, int(traj.phases[i])).reshape(-1)
+                )
+        old_logp = torch.cat(old_parts).to(self.device)
         old_values = self._tensor(np.array(traj.values))
         adv_t = self._tensor(adv)
         ret_t = self._tensor(returns)
@@ -276,8 +326,11 @@ class HAPPOTrainer:
                 sub_obs = obs[mb_idx]
                 sub_idx_t = idx_t[mb_idx]
                 sub_actions = {k: v[mb_idx] for k, v in actions.items()}
-                ev = self.player_policy.evaluate(sub_obs, sub_idx_t, sub_actions)
-                new_logp = ev["logp_bribe"] + ev["logp_door"] + ev["logp_bet"]
+                sub_phases = phases_t[mb_idx]
+                ev = self.player_policy.evaluate(
+                    sub_obs, sub_idx_t, sub_actions, phases=sub_phases
+                )
+                new_logp = ev["logp"]
                 policy_loss = ppo_surrogate_loss(
                     new_logp,
                     old_logp[mb_idx],
@@ -285,11 +338,7 @@ class HAPPOTrainer:
                     cfg.clip_range,
                     cfg.log_ratio_clip,
                 )
-                entropy = (
-                    ev["entropy_bribe"].mean()
-                    + ev["entropy_door"].mean()
-                    + ev["entropy_bet"].mean()
-                )
+                entropy = ev["entropy"].mean()
                 value = ev["value"]
                 v_clip = old_values[mb_idx] + torch.clamp(
                     value - old_values[mb_idx],

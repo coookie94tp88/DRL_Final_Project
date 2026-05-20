@@ -27,6 +27,10 @@ class EnvConfig:
     # Anti-babbling hooks read by the env (most are pure policy-side though).
     bribery_floor: float = 0.0  # forced minimum bribe_pct (0 disables)
 
+    # Optional shaping (Stage-1 curriculum): bonus when a player bets on a signal door.
+    follow_public_bonus: float = 0.0
+    follow_private_bonus: float = 0.0
+
     def validate(self) -> None:
         if self.num_players < 1:
             raise ValueError(f"num_players must be >= 1, got {self.num_players}")

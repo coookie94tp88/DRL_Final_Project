@@ -12,6 +12,8 @@ env:
   balance_visibility: full          # {full, own_only, noisy}
   balance_noise_sigma: 0.1
   bribery_floor: 0.0                # set by anti_babbling curriculum if enabled
+  follow_public_bonus: 0.0          # extra player reward when door == public_signal (BC+RL)
+  follow_private_bonus: 0.0         # extra when door == own private hint
 
 model:
   d_model: 128

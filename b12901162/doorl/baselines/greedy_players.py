@@ -6,9 +6,9 @@ import numpy as np
 
 
 class GreedyPlayer:
-    def __init__(self, bribe_pct: float = 0.05, bet_pct: float = 1.0) -> None:
+    def __init__(self, bribe_pct: float = 0.05, bet_pct: float = 0.25) -> None:
         self.bribe_pct = float(bribe_pct)
-        self.bet_pct = float(bet_pct)
+        self.bet_pct = float(min(max(bet_pct, 0.05), 0.5))
 
     def act(self, env, obs, i: int, phase: int):
         if phase == 0:

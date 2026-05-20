@@ -310,6 +310,136 @@ Compare baselines:
 python -m doorl.watch --baseline truthful_host --seed 42 --override env.num_players=5
 ```
 
+### Environment self-check (run before trusting learned checkpoints)
+
+Eval logs each settled round from `env.last_settlement` (not `_round_*` after `step()`, which would be the **next** round).
+
+**Step 1 — Host signals only** (default dummy players: fixed door A, 0% bribe). Checks MI only:
+
+```bash
+cd b12901162
+python -m doorl.eval --baseline truthful_host --episodes 100 \
+  --override env.num_players=4 --override env.max_rounds=50
+```
+
+Expect: `MI(公開,真門)` and `MI(私人,真門)` **> 1.5** bits (≈2 for four uniform doors).  
+`跟公開門` with dummy players stays ~25% (they always bet A); that is normal.
+
+**Step 2 — Honest Host + greedy players** (players follow public door):
+
+```bash
+python -m doorl.eval --baseline truthful_host --player-baseline greedy_players \
+  --episodes 100 --override env.num_players=4 --override env.max_rounds=50
+```
+
+Expect: MI still **> 1.5**; `跟公開門` / `跟私人門` **> 70%**; bankruptcy low.
+
+If Step 1 fails, fix env/eval before training. If Step 1 passes but your ckpt fails, the issue is training—not the simulator.
+
+Step 2 uses `greedy_players` with **25% max bet** (avoids balance blow-up when everyone wins the same door).
+
+### Staged training (recommended after self-check)
+
+Joint HAPPO (all agents at once) often collapses to “Host drains everyone.” Train in **three stages**:
+
+| Stage | Goal | Command sketch |
+| --- | --- | --- |
+| **1** | Players learn to use honest signals | Fixed `truthful_host`, train players only |
+| **2** | Host learns manipulation vs competent players | `--resume` stage-1 players, `--freeze-players`, train host |
+| **3** | Joint fine-tune | `--resume` stage-2, both sides update, lower `lr` |
+
+**Important:** Player policies are **phase-aware** (bribe only in Phase I; door+bet only in Phase II when `public_signal` is in obs). Older `stage1_players` checkpoints were trained with a bug that mixed phases—**re-run Stage 1** after pulling this fix.
+
+**Stage 1 — players vs truthful Host** (~500k–1M steps):
+
+```bash
+python -m doorl.train --config config/default.yaml --run-name stage1_players --device cuda \
+  --host-baseline truthful_host \
+  --override env.num_players=4 --override env.max_rounds=30 \
+  --override env.bribery_floor=0.02 \
+  --override train.total_timesteps=800000 \
+  --override train.lr=3e-5 --override train.n_epochs=4 \
+  --override train.ent_coef=0.03
+```
+
+Eval (learned players, honest Host):
+
+```bash
+python -m doorl.eval --player-ckpt runs/stage1_players/ckpt/latest.pt \
+  --baseline truthful_host --episodes 100 \
+  --override env.num_players=4 --override env.max_rounds=50
+```
+
+Targets: `bankruptcy_rate` clearly below 0.5, `p_follow_public` > 0.5, bribes > 2%.
+
+**Stage 2 — Host vs frozen stage-1 players** (~800k steps):
+
+```bash
+python -m doorl.train --config config/default.yaml --run-name stage2_host --device cuda \
+  --resume runs/stage1_players/ckpt/latest.pt --freeze-players \
+  --override env.num_players=4 --override env.max_rounds=50 \
+  --override train.total_timesteps=800000 --override train.lr=3e-5
+```
+
+**Stage 3 — joint fine-tune** (~1–2M steps, do not resume `learn_4p_v2`):
+
+```bash
+python -m doorl.train --config config/default.yaml --run-name stage3_joint --device cuda \
+  --resume runs/stage2_host/ckpt/latest.pt \
+  --override env.num_players=4 --override env.max_rounds=50 \
+  --override train.total_timesteps=1500000 --override train.lr=1e-5 \
+  --override train.ent_coef=0.02 \
+  --override train.anti_babbling.host_entropy_bonus=0.01
+```
+
+Optional: add `--override train.watch_interval_iters=25` and run `doorl.watch` on each stage’s `latest.pt`.
+
+**Do not** continue `learn_4p_v2` — that run learned the wrong equilibrium.
+
+### If Stage 1 finishes at ~28% follow-public (BC + shaping)
+
+Pure PPO often **never** learns “bet on `public_signal`” because the bonus is indirect. Use **BC pretrain** then **reward shaping**, then a shorter RL fine-tune.
+
+**Step A — BC** (imitate `truthful_host` + `greedy_players`):
+
+```bash
+python -m doorl.bc_pretrain --config config/default.yaml \
+  --out runs/stage1_bc.pt --device cuda \
+  --override env.num_players=4 --override env.max_rounds=30 \
+  --episodes 3000 --epochs 25 --demo-bribe-pct 0.05 --demo-bet-pct 0.25
+```
+
+Check (expect **follow-public > 55%**):
+
+```bash
+python -m doorl.eval --player-ckpt runs/stage1_bc.pt --baseline truthful_host \
+  --episodes 100 --override env.num_players=4
+```
+
+Note: `runs/stage1_bc.pt` is a **player-init** file (`torch.save` dict with `player` key), not a full training checkpoint.
+
+**Step B — RL fine-tune** with shaping (do **not** resume old `stage1_players_fix`):
+
+```bash
+python -m doorl.train --config config/default.yaml --run-name stage1_bc_rl --device cuda \
+  --host-baseline truthful_host --init-players runs/stage1_bc.pt \
+  --override env.num_players=4 --override env.max_rounds=30 \
+  --override env.bribery_floor=0.02 \
+  --override env.follow_public_bonus=2.0 \
+  --override train.total_timesteps=400000 \
+  --override train.lr=2e-5 --override train.ent_coef=0.02
+```
+
+| `env.follow_public_bonus` | Effect |
+| --- | --- |
+| `0` | shaping off (BC only) |
+| `1–3` | small extra reward when `door == public_signal` at settlement |
+| `5+` | strong hint; can dominate payout signal — use sparingly |
+
+Optional: `--override env.follow_private_bonus=1.0` if you also want to reward matching private hints.
+
+**Pass criteria after B:** `p_follow_public` > 55%, `bankruptcy_rate` < 50% vs truthful Host → then Stage 2.
+
 ### Scripted baseline (no checkpoint)
 
 ```bash
@@ -318,7 +448,8 @@ python -m doorl.eval --config config/default.yaml \
   --override env.num_players=4
 ```
 
-Baselines: `random_host`, `truthful_host`, `noisy_truthful_host`, `greedy_players`, `no_bribe_players`.
+Baselines: `random_host`, `truthful_host`, `noisy_truthful_host`, `greedy_players`, `no_bribe_players`.  
+Combine host + player: `--baseline truthful_host --player-baseline greedy_players`.
 
 ### Metrics to watch (behavior)
 

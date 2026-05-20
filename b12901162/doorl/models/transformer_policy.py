@@ -27,6 +27,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Beta, Categorical
 
+from doorl.env.doorl_env import PHASE_BET, PHASE_BRIBE
+
 
 @dataclass
 class PlayerPolicyConfig:
@@ -204,17 +206,36 @@ class PlayerPolicy(nn.Module):
         bet_dist = Beta(bet_alpha, bet_beta)
         door_dist = Categorical(logits=door_logits)
 
+        device = obs.device
+        batch = obs.size(0)
         if deterministic:
-            bribe_a = b_alpha / (b_alpha + b_beta)
-            bet_a = bet_alpha / (bet_alpha + bet_beta)
-            door_a = door_dist.probs.argmax(dim=-1)
+            bribe_sample = b_alpha / (b_alpha + b_beta)
+            bet_sample = bet_alpha / (bet_alpha + bet_beta)
+            door_sample = door_dist.probs.argmax(dim=-1)
         else:
-            bribe_a = bribe_dist.rsample()
-            bet_a = bet_dist.rsample()
-            door_a = door_dist.sample()
+            bribe_sample = bribe_dist.rsample()
+            bet_sample = bet_dist.rsample()
+            door_sample = door_dist.sample()
 
-        bribe_a = bribe_a.clamp(1e-4, 1.0 - 1e-4)
-        bet_a = bet_a.clamp(1e-4, 1.0 - 1e-4)
+        bribe_sample = bribe_sample.clamp(1e-4, 1.0 - 1e-4)
+        bet_sample = bet_sample.clamp(1e-4, 1.0 - 1e-4)
+
+        # Env phase: only bribe in Phase I; door+bet in Phase II (obs has public/private).
+        if phase == PHASE_BRIBE:
+            bribe_a = bribe_sample
+            door_a = torch.zeros(batch, dtype=torch.long, device=device)
+            bet_a = torch.full((batch,), 0.5, device=device)
+            logp = bribe_dist.log_prob(bribe_a)
+        elif phase == PHASE_BET:
+            bribe_a = torch.zeros(batch, device=device)
+            door_a = door_sample
+            bet_a = bet_sample
+            logp = door_dist.log_prob(door_a) + bet_dist.log_prob(bet_a)
+        else:
+            bribe_a = torch.zeros(batch, device=device)
+            door_a = torch.zeros(batch, dtype=torch.long, device=device)
+            bet_a = torch.full((batch,), 0.5, device=device)
+            logp = torch.zeros(batch, device=device)
 
         action = {
             "bribe_pct": bribe_a.detach().cpu().numpy(),
@@ -222,6 +243,7 @@ class PlayerPolicy(nn.Module):
             "bet_pct": bet_a.detach().cpu().numpy(),
         }
         info = {
+            "logp": logp.detach(),
             "logp_bribe": bribe_dist.log_prob(bribe_a).detach(),
             "logp_door": door_dist.log_prob(door_a).detach(),
             "logp_bet": bet_dist.log_prob(bet_a).detach(),
@@ -234,6 +256,7 @@ class PlayerPolicy(nn.Module):
         obs: torch.Tensor,
         agent_idx: torch.Tensor,
         actions: dict,
+        phases: Optional[torch.Tensor] = None,
     ) -> dict:
         """Recompute log-probs, entropies, and value for PPO/HAPPO updates."""
         bribe, door, bet, value = self.forward(obs, agent_idx)
@@ -250,10 +273,37 @@ class PlayerPolicy(nn.Module):
         bet_a = actions["bet_pct"].clamp(1e-4, 1.0 - 1e-4)
         door_a = actions["door"].long()
 
+        logp_bribe = bribe_dist.log_prob(bribe_a)
+        logp_door = door_dist.log_prob(door_a)
+        logp_bet = bet_dist.log_prob(bet_a)
+        if phases is None:
+            logp = logp_bribe + logp_door + logp_bet
+            ent = (
+                bribe_dist.entropy()
+                + door_dist.entropy()
+                + bet_dist.entropy()
+            )
+        else:
+            phases = phases.long().to(obs.device)
+            logp = torch.zeros_like(logp_bribe)
+            logp = torch.where(phases == PHASE_BRIBE, logp_bribe, logp)
+            logp = torch.where(
+                phases == PHASE_BET, logp_door + logp_bet, logp
+            )
+            ent = torch.zeros_like(logp_bribe)
+            ent = torch.where(phases == PHASE_BRIBE, bribe_dist.entropy(), ent)
+            ent = torch.where(
+                phases == PHASE_BET,
+                door_dist.entropy() + bet_dist.entropy(),
+                ent,
+            )
+
         return {
-            "logp_bribe": bribe_dist.log_prob(bribe_a),
-            "logp_door": door_dist.log_prob(door_a),
-            "logp_bet": bet_dist.log_prob(bet_a),
+            "logp": logp,
+            "logp_bribe": logp_bribe,
+            "logp_door": logp_door,
+            "logp_bet": logp_bet,
+            "entropy": ent,
             "entropy_bribe": bribe_dist.entropy(),
             "entropy_door": door_dist.entropy(),
             "entropy_bet": bet_dist.entropy(),

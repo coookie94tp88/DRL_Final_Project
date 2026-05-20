@@ -11,7 +11,7 @@ bet share is below a configurable threshold `tau`.
 See [`spec.md`](spec.md) for the full design, hypotheses (H1–H4), and risk
 register.
 
-**Training, TensorBoard, checkpoints, resume, and eval:** see **[`TRAINING.md`](TRAINING.md)**.
+**Training, TensorBoard, checkpoints, resume, eval, BC pretrain, and reward shaping:** see **[`TRAINING.md`](TRAINING.md)**.
 
 ## Install
 
