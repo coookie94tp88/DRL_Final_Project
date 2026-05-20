@@ -337,15 +337,19 @@ def train_both(
     bet_log_std_min, bet_log_std_max = -5.0, 1.0
     bet_gumbel_tau = 0.8
     player_sac_alpha = 0.10
-    h_eps_decay = 0.9995
+    h_eps_decay = 0.995
     grad_clip_norm = 1.0
-    phases_per_round_estimate = 4  # BRIBE→SIGNAL→BET plus occasional extra transitions at episode boundaries.
+    phases_per_round_estimate = 4  # 3 core phases (BRIBE→SIGNAL→BET) + 1 buffer for episode-boundary transitions.
     max_loop_iters = total_bet_steps * phases_per_round_estimate
     player_truth_follow_bonus = 0.25
     player_false_follow_penalty = 0.12
-    player_crowding_penalty = 0.08
-    player_trust_profit_bribe_rebate = 0.35
-    host_bribe_signal_coupling_bonus = 0.5
+    player_crowding_penalty = 0.20
+    player_diversity_bonus = 0.10
+    player_trust_profit_bribe_rebate = 1.25
+    player_trust_profit_follow_bonus = 0.20
+    host_truth_private_bonus = 0.30
+    host_weighted_truth_bonus = 1.20
+    host_weighted_lie_penalty = 0.20
     epsilon_stability = 1e-6
 
     player_actor1 = BribeActor(
@@ -414,6 +418,7 @@ def train_both(
     print("🔥 Start co-training (player SAC + host RDQN)")
     last_private_signals = np.zeros(config.num_players, dtype=np.int32)
     prev_round_trust_profit_mask = np.zeros(config.num_players, dtype=np.float32)
+    last_raw_bribes_np = np.zeros(config.num_players, dtype=np.float32)
 
     loop_iters = 0
     while bet_steps < total_bet_steps:
@@ -436,6 +441,7 @@ def train_both(
 
             obs, _, _, _, _ = env.step({"player_bribe_fractions": bribe_action_np})
             current_bribes_np = env.current_bribes.copy()
+            last_raw_bribes_np = current_bribes_np.copy()
             # Apply last-round trust/profit success to this round's bribe penalty:
             # if previous round proved profitable when private info was truthful,
             # this round's bribe cost is partially rebated to encourage higher bribes.
@@ -509,17 +515,27 @@ def train_both(
             bet_steps += 1
             round_in_ep += 1
 
-            host_bribe_income = float(np.sum(-r1_np))
+            host_bribe_income = float(np.sum(last_raw_bribes_np))
+            if "winning_door" not in info:
+                raise KeyError("Expected `winning_door` in env step info during BET phase.")
             winning_door = int(info["winning_door"])
             private_is_truth = (last_private_signals == winning_door).astype(np.float32)
-            bribe_weights = np.maximum(-r1_np, 0.0).astype(np.float32)
-            bribe_weighted_truth_rate = float(
-                np.sum(bribe_weights * private_is_truth) / (np.sum(bribe_weights) + epsilon_stability)
-            )
+            private_truth_rate = float(np.mean(private_is_truth))
+            bribe_weights = np.maximum(last_raw_bribes_np, 0.0).astype(np.float32)
+            bribe_weight_sum = float(np.sum(bribe_weights))
+            if bribe_weight_sum > epsilon_stability:
+                bribe_weighted_truth_rate = float(
+                    np.sum(bribe_weights * private_is_truth) / bribe_weight_sum
+                )
+            else:
+                bribe_weighted_truth_rate = private_truth_rate
+            bribe_weighted_lie_rate = 1.0 - bribe_weighted_truth_rate
             last_host_reward = (
                 float(rewards["host"])
                 + 2.0 * host_bribe_income
-                + host_bribe_signal_coupling_bonus * bribe_weighted_truth_rate
+                + host_truth_private_bonus * private_truth_rate
+                + host_weighted_truth_bonus * bribe_weighted_truth_rate
+                - host_weighted_lie_penalty * bribe_weighted_lie_rate
             )
 
             total_rewards_np = rewards["players"]
@@ -527,11 +543,18 @@ def train_both(
             ep_priv_follow_rate_sum += float(np.mean(follow_private))
             truth_follow_bonus = player_truth_follow_bonus * (private_is_truth * follow_private)
             false_follow_penalty = player_false_follow_penalty * ((1.0 - private_is_truth) * follow_private)
+            trust_profit_follow_bonus = (
+                player_trust_profit_follow_bonus * (prev_round_trust_profit_mask * follow_private)
+            )
+            # step_bet() always pushes one history row before returning, so last door ratios exist here.
             door_ratios = env.hist_door_ratios[-1]
             chosen_door_ratios = np.array([door_ratios[d] for d in door_idx_np], dtype=np.float32)
+            diversity_bonus = player_diversity_bonus * (1.0 - chosen_door_ratios)
             shaped_player_rewards = (
                 total_rewards_np
                 + truth_follow_bonus
+                + trust_profit_follow_bonus
+                + diversity_bonus
                 - false_follow_penalty
                 - player_crowding_penalty * chosen_door_ratios
             )
@@ -714,6 +737,7 @@ def train_both(
                 ep_door_counts.fill(0.0)
                 prev_round_trust_profit_mask.fill(0.0)
                 last_private_signals.fill(0)
+                last_raw_bribes_np.fill(0.0)
 
     player_path, host_path = save_separate_models(
         player_actor1,
