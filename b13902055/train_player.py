@@ -6,66 +6,143 @@ import torch.optim as optim
 from torch.distributions import Normal
 import random
 import copy
+import os
 
 # 載入自訂環境
 from env import OracleGambitEnv, OracleGambitConfig, Phase
 
 # ==========================================
-# 1. 神經網路架構設計 (Neural Networks)
+# 1. 神經網路架構設計 (Neural Networks) - Transformer 版
 # ==========================================
 
 def flatten_obs(obs_dict, device):
-    """將 current 和 history 攤平成一個 1D 向量"""
+    """將 current 和 history 攤平成一個 1D 向量 (供 ReplayBuffer 儲存)"""
     curr = torch.FloatTensor(obs_dict["current"]).to(device)       # (N, 5)
     hist = torch.FloatTensor(obs_dict["history"]).to(device)       # (N, 50, 11)
     hist_flat = hist.view(hist.shape[0], -1)                       # (N, 550)
     return torch.cat([curr, hist_flat], dim=1)                     # (N, 555)
 
+def encode_features(state_flat, num_doors=4, seq_len=50):
+    """
+    在神經網路內部將 555 維資料還原，並對離散訊號進行 One-Hot Encoding
+    返回: curr_encoded (N, 13), hist_encoded (N, 50, 23)
+    """
+    N = state_flat.shape[0]
+    curr = state_flat[:, :5]
+    hist = state_flat[:, 5:].view(N, seq_len, 11)
+    
+    # ─── 處理 Current 狀態 ───
+    alive_bal_bribe = curr[:, 0:3] # 連續數值 (alive, balance, bribe)
+    pub_sig = curr[:, 3].long()
+    priv_sig = curr[:, 4].long()
+    
+    # 將 -1 (無訊號) 映射到 index 4 (類別總數 = 4個門 + 1無訊號 = 5)
+    pub_sig = torch.where(pub_sig < 0, num_doors, pub_sig)
+    priv_sig = torch.where(priv_sig < 0, num_doors, priv_sig)
+    
+    pub_onehot = F.one_hot(pub_sig, num_classes=num_doors+1).float()
+    priv_onehot = F.one_hot(priv_sig, num_classes=num_doors+1).float()
+    
+    # 合併 Current: 3 + 5 + 5 = 13 維
+    curr_encoded = torch.cat([alive_bal_bribe, pub_onehot, priv_onehot], dim=1)
+    
+    # ─── 處理 History 狀態 ───
+    choice = hist[:, :, 0].long()
+    h_pub = hist[:, :, 1].long()
+    h_priv = hist[:, :, 2].long()
+    continuous_hist = hist[:, :, 3:] # 連續數值 (8 個特徵)
+    
+    # 將 -1 映射到 index 4
+    choice = torch.where(choice < 0, num_doors, choice)
+    h_pub = torch.where(h_pub < 0, num_doors, h_pub)
+    h_priv = torch.where(h_priv < 0, num_doors, h_priv)
+    
+    choice_oh = F.one_hot(choice, num_classes=num_doors+1).float()
+    h_pub_oh = F.one_hot(h_pub, num_classes=num_doors+1).float()
+    h_priv_oh = F.one_hot(h_priv, num_classes=num_doors+1).float()
+    
+    # 合併 History: 5 + 5 + 5 + 8 = 23 維
+    hist_encoded = torch.cat([choice_oh, h_pub_oh, h_priv_oh, continuous_hist], dim=2)
+    
+    return curr_encoded, hist_encoded
+
+class TransformerExtractor(nn.Module):
+    """ Transformer 特徵提取器 (處理時間序列) """
+    def __init__(self, curr_dim=13, hist_dim=23, d_model=128, nhead=4, num_layers=2, seq_len=50):
+        super().__init__()
+        # 歷史軌跡的處理
+        self.hist_proj = nn.Linear(hist_dim, d_model)
+        self.pos_emb = nn.Parameter(torch.randn(1, seq_len, d_model)) # 可學習的位置編碼
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True, dim_feedforward=256)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        
+        # 當下狀態的處理
+        self.curr_proj = nn.Linear(curr_dim, d_model)
+        
+        # 融合輸出
+        self.fc_out = nn.Sequential(
+            nn.Linear(d_model * 2, 256),
+            nn.ReLU()
+        )
+        
+    def forward(self, curr_enc, hist_enc):
+        # 1. 歷史軌跡進入 Transformer
+        x = self.hist_proj(hist_enc) + self.pos_emb       # (N, L, d_model)
+        x = self.transformer(x)                           # (N, L, d_model)
+        hist_summary = x[:, -1, :]                        # 取最後一個時間步作為序列總結 (N, d_model)
+        
+        # 2. 當下狀態特徵映射
+        curr_summary = torch.relu(self.curr_proj(curr_enc)) # (N, d_model)
+        
+        # 3. 拼接並輸出最終狀態表徵
+        out = self.fc_out(torch.cat([hist_summary, curr_summary], dim=-1)) # (N, 256)
+        return out
+
 class BribeActor(nn.Module):
     """ Actor 1: 負責決定賄賂比例 (連續動作) """
-    def __init__(self, state_dim):
+    def __init__(self, state_dim=None): # state_dim 參數保留作相容性，實際不直接用於第一層
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(state_dim, 256), nn.ReLU(), nn.Linear(256, 256), nn.ReLU())
+        self.extractor = TransformerExtractor()
         self.mu_layer = nn.Linear(256, 1)
         self.log_std_layer = nn.Linear(256, 1)
 
-    def forward(self, state):
-        feat = self.net(state)
+    def forward(self, state_flat):
+        curr_enc, hist_enc = encode_features(state_flat)
+        feat = self.extractor(curr_enc, hist_enc)
         mu = self.mu_layer(feat)
-        log_std = torch.clamp(self.log_std_layer(feat), -20, 2) # 防止數值爆炸
+        log_std = torch.clamp(self.log_std_layer(feat), -20, 2)
         return mu, log_std
 
-    def sample(self, state):
-        mu, log_std = self.forward(state)
+    def sample(self, state_flat):
+        mu, log_std = self.forward(state_flat)
         std = log_std.exp()
         dist = Normal(mu, std)
-        x_t = dist.rsample() # Reparameterization trick
-        action = torch.sigmoid(x_t) # 壓縮到 0~1
-        # 計算 Log Prob 並修正 Sigmoid 的 Jacobian
+        x_t = dist.rsample()
+        action = torch.sigmoid(x_t)
         log_prob = dist.log_prob(x_t) - torch.log(action * (1 - action) + 1e-6)
         return action, log_prob.sum(dim=-1, keepdim=True)
 
 class BetActor(nn.Module):
     """ Actor 2: 負責選門 (離散) 與下注比例 (連續) """
-    def __init__(self, state_dim, num_doors=4):
+    def __init__(self, state_dim=None, num_doors=4):
         super().__init__()
-        self.net = nn.Sequential(nn.Linear(state_dim, 256), nn.ReLU(), nn.Linear(256, 256), nn.ReLU())
+        self.extractor = TransformerExtractor()
         self.door_logits_layer = nn.Linear(256, num_doors)
         self.bet_mu_layer = nn.Linear(256, 1)
         self.bet_log_std_layer = nn.Linear(256, 1)
 
-    def sample(self, state):
-        feat = self.net(state)
+    def sample(self, state_flat):
+        curr_enc, hist_enc = encode_features(state_flat)
+        feat = self.extractor(curr_enc, hist_enc)
         
-        # 1. 處理離散的選門 (Gumbel-Softmax Trick)
+        # 處理離散的選門 (Gumbel-Softmax Trick)
         door_logits = self.door_logits_layer(feat)
-        door_one_hot = F.gumbel_softmax(door_logits, tau=1.0, hard=True) # 輸出 One-hot
+        door_one_hot = F.gumbel_softmax(door_logits, tau=1.0, hard=True)
         door_probs = F.softmax(door_logits, dim=-1)
-        # Log prob 僅計算被選中那個門的機率
         log_prob_door = torch.sum(torch.log(door_probs + 1e-8) * door_one_hot, dim=-1, keepdim=True)
-        door_idx = door_one_hot.argmax(dim=-1) # 給環境用的 index
+        door_idx = door_one_hot.argmax(dim=-1)
 
-        # 2. 處理連續的下注比例
+        # 處理連續的下注比例
         bet_mu = self.bet_mu_layer(feat)
         bet_log_std = torch.clamp(self.bet_log_std_layer(feat), -20, 2)
         bet_dist = Normal(bet_mu, bet_log_std.exp())
@@ -77,16 +154,25 @@ class BetActor(nn.Module):
         return door_idx, door_one_hot, bet_fraction, total_log_prob
 
 class Critic(nn.Module):
-    """ 通用的 Q 網路 (Critic) """
-    def __init__(self, state_dim, action_dim):
+    """ SAC 的 Q 網路 (Critic) - 包含兩組獨立特徵提取器防止互相干擾 """
+    def __init__(self, state_dim=None, action_dim=1):
         super().__init__()
-        # 雙 Q 網路解決高估問題 (Double Q-learning)
-        self.q1 = nn.Sequential(nn.Linear(state_dim + action_dim, 256), nn.ReLU(), nn.Linear(256, 1))
-        self.q2 = nn.Sequential(nn.Linear(state_dim + action_dim, 256), nn.ReLU(), nn.Linear(256, 1))
+        self.ext1 = TransformerExtractor()
+        self.q1_head = nn.Sequential(nn.Linear(256 + action_dim, 256), nn.ReLU(), nn.Linear(256, 1))
+        
+        self.ext2 = TransformerExtractor()
+        self.q2_head = nn.Sequential(nn.Linear(256 + action_dim, 256), nn.ReLU(), nn.Linear(256, 1))
 
-    def forward(self, state, action):
-        sa = torch.cat([state, action], dim=-1)
-        return self.q1(sa), self.q2(sa)
+    def forward(self, state_flat, action):
+        curr_enc, hist_enc = encode_features(state_flat)
+        
+        feat1 = self.ext1(curr_enc, hist_enc)
+        q1 = self.q1_head(torch.cat([feat1, action], dim=-1))
+        
+        feat2 = self.ext2(curr_enc, hist_enc)
+        q2 = self.q2_head(torch.cat([feat2, action], dim=-1))
+        
+        return q1, q2
 
 # ==========================================
 # 2. Replay Buffer (兩步 MDP 特製版)
@@ -165,6 +251,9 @@ def train():
     # 初始化環境與維度
     config = OracleGambitConfig(num_players=10, max_rounds=200, initial_balance=1000)
     env = OracleGambitEnv(config=config)
+
+    checkpoint_dir = "checkpoints"
+    os.makedirs(checkpoint_dir, exist_ok=True)
     
     state_dim = 5 + (50 * 11) # current(5) + history(50*11)
     
@@ -196,7 +285,7 @@ def train():
     episodes = 0
     
     print("開始訓練 Two-Step SAC...")
-    for step in range(50000): # 總訓練步數
+    for step in range(500000): # 總訓練步數
         
         # === 階段 1: 賄賂 (Actor 1) ===
         s1_tensor = flatten_obs(s1_dict, device)
@@ -256,8 +345,24 @@ def train():
             obs, info = env.reset()
             s1_dict = obs["players"]
             episodes += 1
+            
+            # --- 列印訓練進度 ---
             if episodes % 10 == 0:
                 print(f"Episode: {episodes}, Avg Reward: {episode_reward/10:.2f}")
+            
+            # --- 新增：定期保存模型 (例如每 100 局存一次) ---
+            if episodes % 100 == 0:
+                save_path = os.path.join(checkpoint_dir, f"sac_checkpoint_ep_{episodes}.pth")
+                # 我們把 4 個網路的權重包成一個字典存起來
+                torch.save({
+                    'episode': episodes,
+                    'actor1_state_dict': actor1.state_dict(),
+                    'actor2_state_dict': actor2.state_dict(),
+                    'critic1_state_dict': critic1.state_dict(),
+                    'critic2_state_dict': critic2.state_dict(),
+                }, save_path)
+                print(f"💾 [Checkpoint] 模型已儲存至: {save_path}")
+
             episode_reward = 0
 
         # === 神經網路訓練更新 ===
@@ -333,6 +438,14 @@ def train():
                 target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
             for param, target_param in zip(critic2.parameters(), critic2_target.parameters()):
                 target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
-
+    final_path = os.path.join(checkpoint_dir, "sac_final_model.pth")
+    torch.save({
+        'episode': episodes,
+        'actor1_state_dict': actor1.state_dict(),
+        'actor2_state_dict': actor2.state_dict(),
+        'critic1_state_dict': critic1.state_dict(),
+        'critic2_state_dict': critic2.state_dict(),
+    }, final_path)
+    print(f"🎉 訓練完成！最終模型已儲存至: {final_path}")
 if __name__ == "__main__":
     train()
