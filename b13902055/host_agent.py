@@ -1,90 +1,69 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-
 from env import OracleGambitConfig
 
 
-class HostRDQN(nn.Module):
-    def __init__(self, num_players=10, num_doors=4, hist_dim=10, d_model=128):
+class HostPolicy(nn.Module):
+    def __init__(self, config: OracleGambitConfig):
         super().__init__()
-        self.num_players = num_players
-        self.num_doors = num_doors
+        curr_dim = config.current_host_dim
+        players_dim = config.num_players * config.host_player_state_dim
+        hist_dim = config.history_window * config.hist_host_dim
 
-        self.lstm = nn.LSTM(input_size=hist_dim, hidden_size=d_model, batch_first=True)
-        self.fc_curr = nn.Linear(num_doors + num_players, d_model)
-        self.fc_fusion = nn.Sequential(nn.Linear(d_model * 2, 256), nn.ReLU())
-        self.q_pub = nn.Linear(256, num_doors)
-        self.q_privs = nn.ModuleList([nn.Linear(256, num_doors) for _ in range(num_players)])
+        self.net = nn.Sequential(
+            nn.Linear(curr_dim + players_dim + hist_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+        )
 
-    def forward(self, curr, hist):
-        _, (h_n, _) = self.lstm(hist)
-        hist_feat = h_n[-1]
-        curr_feat = F.relu(self.fc_curr(curr))
-        merged = self.fc_fusion(torch.cat([hist_feat, curr_feat], dim=-1))
-        q_pub_vals = self.q_pub(merged)
-        q_priv_vals = [head(merged) for head in self.q_privs]
-        return q_pub_vals, q_priv_vals
+        self.num_doors = config.num_doors
+        self.num_players = config.num_players
+
+        self.public_head = nn.Linear(128, self.num_doors)
+        self.private_head = nn.Linear(128, self.num_players * self.num_doors)
+
+    def forward(self, obs):
+        cur = obs["current"].flatten()
+        players = obs["players"].flatten()
+        hist = obs["history"].flatten()
+        x = torch.cat([cur, players, hist], dim=0)
+        x = self.net(x)
+
+        public_logits = self.public_head(x)
+        private_logits = self.private_head(x).view(self.num_players, self.num_doors)
+
+        return public_logits, private_logits
 
 
 class TrainedHostAgent:
-    def __init__(self, checkpoint_path: str, config: OracleGambitConfig, hist_dim: int | None = None, device: str = "auto"):
-        if device == "auto":
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        else:
-            self.device = torch.device(device)
+    def __init__(self, model_path: str, config: OracleGambitConfig, device: str = "cpu"):
+        self.device = torch.device(device)
+        self.policy = HostPolicy(config).to(self.device)
+        state = torch.load(model_path, map_location=self.device)
+        self.policy.load_state_dict(state)
+        self.policy.eval()
 
-        checkpoint = torch.load(checkpoint_path, map_location=self.device)
-        self.config = config
+    def get_action(self, env, deterministic: bool = True):
+        host_obs_np = env._get_host_obs()
+        host_obs = {
+            "current": torch.tensor(host_obs_np["current"], dtype=torch.float32, device=self.device),
+            "players": torch.tensor(host_obs_np["players"], dtype=torch.float32, device=self.device),
+            "history": torch.tensor(host_obs_np["history"], dtype=torch.float32, device=self.device),
+        }
 
-        ckpt_num_doors = checkpoint.get("num_doors")
-        if ckpt_num_doors is None:
-            print("⚠️ host checkpoint has no 'num_doors' metadata; falling back to config.num_doors.")
-            self.num_doors = int(config.num_doors)
-        else:
-            self.num_doors = int(ckpt_num_doors)
-        effective_hist_dim = int(hist_dim if hist_dim is not None else config.hist_host_dim)
-
-        self.rdqn = HostRDQN(
-            num_players=config.num_players,
-            num_doors=self.num_doors,
-            hist_dim=effective_hist_dim,
-        ).to(self.device)
-
-        state_dict = checkpoint["host_rdqn"] if "host_rdqn" in checkpoint else checkpoint
-        self.rdqn.load_state_dict(state_dict)
-        self.rdqn.eval()
-
-        print(
-            f"✅ HostAgent loaded (Episode {checkpoint.get('episode', 'Unknown')}, Doors={self.num_doors}, Device={self.device})"
-        )
-
-    def _process_obs(self, env):
-        c = self.config
-        if c.num_doors != self.num_doors:
-            raise ValueError(
-                f"Env doors ({c.num_doors}) and host model doors ({self.num_doors}) mismatch."
-            )
-
-        winning_door = env.current_winning_door
-        bribes = env.current_bribes
-
-        win_door_oh = np.zeros(self.num_doors, dtype=np.float32)
-        if winning_door >= 0:
-            win_door_oh[winning_door] = 1.0
-
-        curr_processed = np.concatenate([win_door_oh, bribes])
-        curr_tensor = torch.as_tensor(curr_processed, dtype=torch.float32, device=self.device).unsqueeze(0)
-
-        hist = env._get_observations()["host"]["history"]
-        hist_tensor = torch.as_tensor(hist, dtype=torch.float32, device=self.device).unsqueeze(0)
-        return curr_tensor, hist_tensor
-
-    def get_action(self, env):
-        curr_tensor, hist_tensor = self._process_obs(env)
         with torch.no_grad():
-            q_pub, q_privs = self.rdqn(curr_tensor, hist_tensor)
-            pub_act = q_pub.argmax(dim=-1).item()
-            priv_acts = [q.argmax(dim=-1).item() for q in q_privs]
-        return pub_act, np.array(priv_acts, dtype=np.int32)
+            public_logits, private_logits = self.policy(host_obs)
+
+            if deterministic:
+                public_signal = torch.argmax(public_logits).item()
+                private_signals = torch.argmax(private_logits, dim=1).cpu().numpy()
+            else:
+                public_dist = torch.distributions.Categorical(logits=public_logits)
+                private_dist = torch.distributions.Categorical(logits=private_logits)
+
+                public_signal = public_dist.sample().item()
+                private_signals = private_dist.sample().cpu().numpy()
+
+        return public_signal, private_signals
