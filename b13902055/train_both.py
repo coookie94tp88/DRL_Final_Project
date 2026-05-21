@@ -202,12 +202,12 @@ def train(total_rounds=10000, save_every=20):
             round_count += 1
 
         if round_count % save_every == 0 and round_count > 0:
-            player_policy.save("player_model.zip")
-            torch.save(host_policy.state_dict(), "host_model.pt")
+            player_policy.save("./checkpoints/player_model.zip")
+            torch.save(host_policy.state_dict(), "./checkpoints/host_model.pt")
             print(f"[Saved @ round {round_count}]")
 
-    player_policy.save("player_model.zip")
-    torch.save(host_policy.state_dict(), "host_model.pt")
+    player_policy.save("./checkpoints/player_model.zip")
+    torch.save(host_policy.state_dict(), "./checkpoints/host_model.pt")
 
 
 if __name__ == "__main__":
