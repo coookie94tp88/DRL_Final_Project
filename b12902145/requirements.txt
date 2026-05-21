@@ -1,0 +1,34 @@
+# ────────────────────────────────────────────────────────────────
+# OracleGambit – Python dependencies
+# 建議 Python 版本：3.10 或 3.11
+#
+# 建立虛擬環境：
+#   python -m venv venv
+#   source venv/bin/activate        # Linux / macOS
+#   venv\Scripts\activate           # Windows
+#   pip install -r requirements.txt
+# ────────────────────────────────────────────────────────────────
+
+# ── 核心環境依賴 ─────────────────────────────────────────────────
+numpy>=1.26,<3.0          # 向量運算（環境核心）
+gymnasium>=1.0,<2.0       # 觀察 / 動作空間定義
+
+# ── MARL 框架（可選，提供 AEC 標準介面） ─────────────────────────
+pettingzoo>=1.24,<2.0
+
+# ── 深度學習（Transformer Agent 必需） ──────────────────────────
+torch>=2.2,<3.0           # PyTorch 主體
+# 若使用 CUDA 12.x，安裝時改用：
+# pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# ── RL 訓練框架（擇一即可，兩者皆相容 step_all 介面） ────────────
+# stable-baselines3>=2.3,<3.0   # 若使用 SB3 單智能體基線
+# ray[rllib]>=2.9,<3.0          # 若使用 RLlib 做多智能體訓練
+
+# ── 實驗追蹤與視覺化 ─────────────────────────────────────────────
+tensorboard>=2.16
+matplotlib>=3.8
+pandas>=2.2
+
+# ── 開發 / 測試工具 ───────────────────────────────────────────────
+pytest>=8.0
