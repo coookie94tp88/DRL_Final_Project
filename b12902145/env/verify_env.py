@@ -1,32 +1,31 @@
 """
-OracleGambit 環境驗證腳本
-=========================
-涵蓋以下六個面向的數學與邏輯正確性檢查：
+OracleGambit (Simplified) — 環境驗證腳本
+==========================================
+涵蓋以下五個面向：
   1. 觀察向量維度
-  2. Payout 公式數學性質
-  3. 資金守恆（Host 收到的 = Players 失去的）
-  4. 破產救濟機制
-  5. 歷史 Buffer padding 與 attention mask
-  6. 多回合穩定性（連跑 200 回合不 NaN / 不 crash）
+  2. Multiplier / Payout 公式數學性質
+  3. Reward 守恆（zero-sum）
+  4. 歷史 Buffer padding 與 attention mask
+  5. 多回合穩定性（連跑 200 回合不 NaN / 不 crash）
 """
 
-import sys
-import os
+import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 import numpy as np
-from env.oracle_gambit_env import OracleGambitEnv
+from env.oracle_gambit_env import (
+    OracleGambitEnv,
+    _pad_history,
+    _attention_mask,
+)
+import collections
 
 PASS = "\033[92m[PASS]\033[0m"
 FAIL = "\033[91m[FAIL]\033[0m"
-INFO = "\033[94m[INFO]\033[0m"
 
 def check(name: str, cond: bool, detail: str = "") -> bool:
-    symbol = PASS if cond else FAIL
-    msg = f"  {symbol} {name}"
-    if detail:
-        msg += f"\n         {detail}"
-    print(msg)
+    tag = PASS if cond else FAIL
+    print(f"  {tag} {name}" + (f"\n         {detail}" if detail else ""))
     return cond
 
 
@@ -34,267 +33,216 @@ def check(name: str, cond: bool, detail: str = "") -> bool:
 # 1. 觀察向量維度
 # -----------------------------------------------------------------------
 def test_obs_shapes() -> bool:
-    print("\n[1] 觀察向量維度檢查")
+    print("\n[1] 觀察向量維度")
     env = OracleGambitEnv(num_players=4, num_doors=4, history_window=10, max_rounds=50)
     env.reset(seed=0)
-
     ok = True
     for agent in env.possible_agents:
         obs = env.observe(agent)
         expected = env.observation_space(agent).shape[0]
-        match = (obs.shape[0] == expected)
         ok &= check(
             f"observe('{agent}') shape",
-            match,
+            obs.shape[0] == expected,
             f"got {obs.shape[0]}, expected {expected}",
         )
-        no_nan = not np.isnan(obs).any()
-        ok &= check(f"observe('{agent}') no NaN at init", no_nan)
+        ok &= check(f"observe('{agent}') no NaN at init", not np.isnan(obs).any())
     return ok
 
 
 # -----------------------------------------------------------------------
-# 2. Payout 公式數學性質
+# 2. Multiplier 公式數學性質
 # -----------------------------------------------------------------------
 def test_payout_math() -> bool:
-    print("\n[2] Payout 公式數學性質")
-    env = OracleGambitEnv(payout_threshold=0.25)
+    print("\n[2] Multiplier 公式數學性質  (θ=0.20)")
+    env = OracleGambitEnv(payout_threshold=0.20)
+    θ = env.payout_threshold   # 0.20
     ok = True
 
-    # 在 x = θ 時，Host 應損益兩平：total_pool = total_payout
-    # 即 W * M(θ) = W / θ  =>  M(θ) = 1 + 0.75/0.25 = 4
-    theta = env.payout_threshold
-    M_at_threshold = 1 + (1 - theta) / theta  # 應等於 4.0
+    # M(θ) = 1 + (1-θ)/θ = 1 + 0.8/0.2 = 5.0
+    M_at_θ = env.calculate_multiplier(θ)
+    ok &= check(f"M(θ={θ}) = {M_at_θ:.4f} ≈ 5.0", abs(M_at_θ - 5.0) < 1e-9)
+
+    # 在 x=θ 時, N*x*M(x) = N*θ*5 = N*(0.2*5) = N → break-even
+    N = 10
+    x = θ
+    total_payout = N * x * env.calculate_multiplier(x)  # = N*θ*M(θ) = N
     ok &= check(
-        f"M(θ={theta}) = {M_at_threshold:.4f} ≈ 4.0",
-        abs(M_at_threshold - 4.0) < 1e-9,
+        f"At x=θ: total_payout({total_payout:.4f}) ≈ pool({float(N):.4f})",
+        abs(total_payout - N) < 1e-9,
     )
 
-    # 在 x = θ 時，Host 損益兩平 check：
-    # total_payout = W * M = (x * P) * M = θ * P * (1 + (1-θ)/θ) = P
-    x = theta
-    P = 1000.0
-    W = x * P
-    total_payout = env.calculate_payout(W, x)
-    ok &= check(
-        f"At x=θ: total_payout ({total_payout:.4f}) ≈ P ({P:.4f})",
-        abs(total_payout - P) < 1e-6,
-    )
-
-    # x < θ → Host profit（payout < pool）
+    # x < θ → Host profits (payout < pool)
     x_low = 0.10
-    W_low = x_low * P
-    payout_low = env.calculate_payout(W_low, x_low)
+    payout_low = N * x_low * env.calculate_multiplier(x_low)
     ok &= check(
-        f"At x={x_low} < θ: Host profits (payout {payout_low:.1f} < P {P:.1f})",
-        payout_low < P,
+        f"At x={x_low} < θ: payout({payout_low:.2f}) < pool({N})",
+        payout_low < N,
     )
 
-    # x > θ → Host loss（payout > pool）
+    # x > θ → Host loses (payout > pool)
     x_high = 0.50
-    W_high = x_high * P
-    payout_high = env.calculate_payout(W_high, x_high)
+    payout_high = N * x_high * env.calculate_multiplier(x_high)
     ok &= check(
-        f"At x={x_high} > θ: Host loses (payout {payout_high:.1f} > P {P:.1f})",
-        payout_high > P,
+        f"At x={x_high} > θ: payout({payout_high:.2f}) > pool({N})",
+        payout_high > N,
     )
 
-    # 單調性：x 越大，multiplier 越小
+    # 嚴格遞減
     xs = [0.05, 0.10, 0.20, 0.40, 0.80]
-    Ms = [1 + (1 - theta) / x for x in xs]
-    monotone = all(Ms[i] > Ms[i+1] for i in range(len(Ms)-1))
+    Ms = [env.calculate_multiplier(x) for x in xs]
     ok &= check(
-        "Multiplier is strictly decreasing in x",
-        monotone,
+        "Multiplier strictly decreasing in x",
+        all(Ms[i] > Ms[i+1] for i in range(len(Ms)-1)),
         f"M values: {[f'{m:.3f}' for m in Ms]}",
     )
+
+    # M(0) → 0 (no winners → no payout)
+    ok &= check("M(0) = 0.0", env.calculate_multiplier(0.0) == 0.0)
+
     return ok
 
 
 # -----------------------------------------------------------------------
-# 3. 資金守恆（Money Conservation）
+# 3. Reward 守恆 (zero-sum)
 # -----------------------------------------------------------------------
-def test_money_conservation() -> bool:
-    print("\n[3] 資金守恆檢查（Host 收到的 = Players 淨損失）")
-    env = OracleGambitEnv(
-        num_players=4, initial_balance=1000.0,
-        fee_rate=0.0,        # 先關閉抽成，驗證純 zero-sum
-        welfare_amount=0.0,  # 關閉救濟金
-        max_rounds=1, seed=7,
-    )
+def test_zero_sum() -> bool:
+    print("\n[3] Reward 守恆 (zero-sum)")
+    N = 6
+    env = OracleGambitEnv(num_players=N, num_doors=4, payout_threshold=0.20, seed=7)
     env.reset(seed=7)
-
-    # 記錄初始總資金（Host 沒有初始資金，只計 Players）
-    init_total = sum(
-        env._balances[f"player_{i}"] for i in range(env.num_players)
-    )
-
-    # 讓所有 player 全部下注在同一扇門（刻意讓少數派），host 亂發 signal
-    rng = np.random.default_rng(99)
-    actions_p1 = {"host": rng.random(1 + env.num_players).astype(np.float32)}
-    for pid in range(env.num_players):
-        actions_p1[f"player_{pid}"] = 0.05  # 5% 賄賂
-
-    actions_p2 = {}
-    for pid in range(env.num_players):
-        door_frac = (env._correct_door / (env.num_doors - 1)) if env.num_doors > 1 else 0.0
-        # player_0 猜對門，其他猜錯（模擬 minority 情境）
-        if pid == 0:
-            actions_p2[f"player_{pid}"] = (door_frac, 0.5)  # 50% bet
-        else:
-            wrong_door = (env._correct_door + 1) % env.num_doors
-            actions_p2[f"player_{pid}"] = (wrong_door / max(env.num_doors - 1, 1), 0.5)
-
-    rewards = env.step_all(actions_p1, actions_p2)
-
-    # fee_rate=0 時，所有玩家的 reward 總和 + host reward 應約等於 0（zero-sum）
-    player_reward_total = sum(rewards[f"player_{i}"] for i in range(env.num_players))
-    host_reward = rewards["host"]
-    total = player_reward_total + host_reward
-
-    ok = check(
-        f"Zero-sum (fee=0): Σ_player_rewards + host_reward = {total:.4f} ≈ 0",
-        abs(total) < 1.0,  # 允許浮點誤差
-        f"  player total: {player_reward_total:.4f}, host: {host_reward:.4f}",
-    )
-    return ok
-
-
-# -----------------------------------------------------------------------
-# 4. 破產救濟機制
-# -----------------------------------------------------------------------
-def test_welfare() -> bool:
-    print("\n[4] 破產救濟機制")
-    env = OracleGambitEnv(
-        num_players=2, initial_balance=100.0, welfare_amount=10.0,
-        fee_rate=0.0, max_rounds=5, seed=1,
-    )
-    env.reset(seed=1)
-
+    rng = np.random.default_rng(999)
     ok = True
-    # 強制 player_0 下注所有資金在錯誤的門
-    for _ in range(3):
-        correct = env._correct_door
-        wrong = (correct + 1) % env.num_doors
-        actions_p1 = {"host": np.zeros(1 + env.num_players, dtype=np.float32)}
-        for pid in range(env.num_players):
-            actions_p1[f"player_{pid}"] = 0.0  # 不賄賂
 
-        actions_p2 = {
-            "player_0": (wrong / max(env.num_doors - 1, 1), 1.0),   # 全下錯門
-            "player_1": (correct / max(env.num_doors - 1, 1), 0.1),  # 小額猜對
-        }
-        env.step_all(actions_p1, actions_p2)
+    for trial in range(50):
+        host_act = rng.random()
+        player_acts = {f"player_{i}": rng.random() for i in range(N)}
+        rewards = env.step_all(host_act, player_acts)
 
-    # 檢查不管幾回合，所有 player 餘額 >= welfare_amount (> 0)
-    for pid in range(env.num_players):
-        name = f"player_{pid}"
-        bal = env._balances[name]
+        total = sum(rewards.values())
+        # 由 reward 定義：Σ players + host = N*(M(x)-1)*x*N/N + N*(θ-x)*(-1)*(1-x)
+        # 即 N*x*(M(x)-1) - N*(1-x) + N*(θ-x)
+        # = N*(x*(1-θ)/x) - N*(1-x) + N*(θ-x)
+        # = N*(1-θ) - N + N*x + N*θ - N*x
+        # = N*(1-θ) - N + N*θ = N*(1 - θ + θ - 1) = 0 ✓
         ok &= check(
-            f"{name} balance ({bal:.2f}) >= welfare_amount ({env.welfare_amount})",
-            bal >= env.welfare_amount,
+            f"trial {trial+1}: Σrewards = {total:.6f} ≈ 0",
+            abs(total) < 1e-9,
         )
+        if not ok:
+            break
+
     return ok
 
 
 # -----------------------------------------------------------------------
-# 5. 歷史 Buffer padding 與 attention mask
+# 4. 歷史 Buffer padding 與 attention mask
 # -----------------------------------------------------------------------
 def test_history_buffer() -> bool:
-    print("\n[5] 歷史 Buffer padding 與 attention mask")
-    from env.oracle_gambit_env import _pad_history, _build_attention_mask
-    import collections
-
-    L = 5
-    feat = 3
+    print("\n[4] 歷史 Buffer padding 與 attention mask")
+    L, feat = 5, 3
     buf: collections.deque = collections.deque(maxlen=L)
     ok = True
 
-    # 空 buffer → 全部是 PAD
+    # 空 buffer → 全部 PAD
     h = _pad_history(buf, L, feat)
-    m = _build_attention_mask(buf, L)
-    ok &= check("Empty buffer: all padding", (h == -1).all() and not m.any())
+    m = _attention_mask(buf, L)
+    ok &= check("Empty buf: all PAD", (h == -1).all() and not m.any())
 
-    # 推入 2 筆
+    # 2 筆資料
     buf.append(np.array([1.0, 2.0, 3.0]))
     buf.append(np.array([4.0, 5.0, 6.0]))
     h = _pad_history(buf, L, feat)
-    m = _build_attention_mask(buf, L)
-    ok &= check("2/5 filled: first 3 rows are padding", (h[:3] == -1).all())
-    ok &= check("2/5 filled: last 2 rows are valid data", not (h[3:] == -1).any())
-    ok &= check("Mask: first 3 False, last 2 True",
-                not m[:3].any() and m[3:].all())
+    m = _attention_mask(buf, L)
+    ok &= check("2/5: first 3 rows padding", (h[:3] == -1).all())
+    ok &= check("2/5: last 2 rows valid",    not (h[3:] == -1).any())
+    ok &= check("Mask: [F,F,F,T,T]",         not m[:3].any() and m[3:].all())
 
     # 塞滿
     for v in range(3, 6):
         buf.append(np.ones(feat) * v)
     h = _pad_history(buf, L, feat)
-    m = _build_attention_mask(buf, L)
-    ok &= check("Full buffer: no padding", not (h == -1).any() and m.all())
+    m = _attention_mask(buf, L)
+    ok &= check("Full: no padding, all True mask", not (h == -1).any() and m.all())
+
+    # 透過 env 驗證實際觀測在多回合後 mask 正確增長
+    env = OracleGambitEnv(num_players=2, history_window=10, max_rounds=20)
+    env.reset(seed=0)
+    rng = np.random.default_rng(1)
+    for step in range(5):
+        env.step_all(rng.random(), {f"player_{i}": rng.random() for i in range(2)})
+    # 5 rounds played → 5 valid slots at end of mask section
+    obs_p = env.observe("player_0")
+    L10 = 10
+    feat_p = env._player_hist_feat
+    hist_flat = obs_p[:L10 * feat_p]
+    mask_flat = obs_p[L10 * feat_p: L10 * feat_p + L10].astype(bool)
+    ok &= check("After 5 rounds: last 5 mask True",  mask_flat[-5:].all())
+    ok &= check("After 5 rounds: first 5 mask False", not mask_flat[:5].any())
+
     return ok
 
 
 # -----------------------------------------------------------------------
-# 6. 多回合穩定性
+# 5. 多回合穩定性
 # -----------------------------------------------------------------------
 def test_stability(num_rounds: int = 200) -> bool:
-    print(f"\n[6] 多回合穩定性（{num_rounds} 回合隨機動作）")
-    env = OracleGambitEnv(num_players=6, max_rounds=num_rounds, seed=42)
+    print(f"\n[5] 多回合穩定性 ({num_rounds} 回合)")
+    N = 6
+    env = OracleGambitEnv(num_players=N, max_rounds=num_rounds, seed=42)
     env.reset(seed=42)
     rng = np.random.default_rng(0)
     ok = True
 
     for r in range(num_rounds):
-        host_act = rng.random(1 + env.num_players).astype(np.float32)
-        actions_p1 = {"host": host_act}
-        actions_p2 = {}
-        for pid in range(env.num_players):
-            name = f"player_{pid}"
-            actions_p1[name] = float(rng.random())
-            actions_p2[name] = (float(rng.random()), float(rng.random()))
+        host_act = rng.random()
+        player_acts = {f"player_{i}": rng.random() for i in range(N)}
+        try:
+            rewards = env.step_all(host_act, player_acts)
+        except Exception as e:
+            return check(f"Round {r+1} crashed", False, str(e))
 
-        rewards = env.step_all(actions_p1, actions_p2)
+        no_nan = all(not np.isnan(v) for v in rewards.values())
+        ok &= check(f"Round {r+1}: no NaN rewards", no_nan)
+        if not no_nan:
+            break
 
-        # 每 50 回合做一次觀察 NaN 檢查
-        if r % 50 == 0:
-            for agent in env.possible_agents:
-                obs = env.observe(agent)
-                if np.isnan(obs).any():
-                    ok &= check(f"Round {r}: no NaN in obs({agent})", False)
-
-        # 餘額永遠 >= welfare_amount
-        for pid in range(env.num_players):
-            name = f"player_{pid}"
-            if env._balances[name] < env.welfare_amount - 1e-6:
-                ok &= check(
-                    f"Round {r}: {name} balance below welfare",
-                    False,
-                    f"balance = {env._balances[name]:.4f}",
-                )
+        for agent in env.possible_agents:
+            obs = env.observe(agent)
+            no_obs_nan = not np.isnan(obs).any()
+            ok &= check(f"Round {r+1} {agent} obs no NaN", no_obs_nan)
+            if not no_obs_nan:
                 break
+        if not ok:
+            break
 
-    ok &= check(f"{num_rounds} rounds completed without crash or NaN", ok)
     return ok
 
 
 # -----------------------------------------------------------------------
-# Main
+# Runner
 # -----------------------------------------------------------------------
-if __name__ == "__main__":
+def main() -> None:
     results = [
-        test_obs_shapes(),
-        test_payout_math(),
-        test_money_conservation(),
-        test_welfare(),
-        test_history_buffer(),
-        test_stability(),
+        ("Observation Shapes",    test_obs_shapes()),
+        ("Multiplier Math",       test_payout_math()),
+        ("Zero-Sum Rewards",      test_zero_sum()),
+        ("History Buffer",        test_history_buffer()),
+        ("Stability (200 rounds)", test_stability()),
     ]
-    total = len(results)
-    passed = sum(results)
-    print(f"\n{'='*50}")
-    print(f"Result: {passed}/{total} test groups passed")
-    if passed < total:
-        print("Some checks FAILED. Please review the output above.")
-        sys.exit(1)
-    else:
-        print("All checks PASSED.")
+
+    print(f"\n{'═'*50}")
+    print("  RESULTS")
+    print(f"{'═'*50}")
+    passed = 0
+    for name, ok in results:
+        tag = "\033[92m✓\033[0m" if ok else "\033[91m✗\033[0m"
+        print(f"  {tag}  {name}")
+        passed += ok
+    print(f"{'═'*50}")
+    print(f"  {passed}/{len(results)} test groups passed")
+    print(f"{'═'*50}\n")
+    sys.exit(0 if passed == len(results) else 1)
+
+
+if __name__ == "__main__":
+    main()
