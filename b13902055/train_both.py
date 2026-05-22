@@ -164,33 +164,50 @@ class PlayerEnvWrapper(gym.Env):
 # -----------------------------
 # Training loop (same loop)
 # -----------------------------
-def train(total_rounds=10000, save_every=20):
+def train(
+    total_rounds=10000,
+    save_every=50,
+    ckpt_dir="./checkpoints",
+    player_resume_path="./checkpoints/player_model_1450.zip",
+    host_resume_path=None,
+):
+    import os
+
+    os.makedirs(ckpt_dir, exist_ok=True)
     cfg = OracleGambitConfig(num_doors=3, num_players=10, max_rounds=20)
     base_env = OracleGambitEnv(cfg)
 
-    # Host policy
     host_policy = HostPolicy(base_env.host_observation_space, base_env.host_action_space)
     host_policy.train()
     host_optimizer = optim.Adam(host_policy.parameters(), lr=1e-4)
-
-    # Player wrapper env (uses host policy internally)
     player_env = PlayerEnvWrapper(base_env, host_policy)
 
-    # Player policy (SB3 PPO)
-    player_policy = PPO(
-        "MultiInputPolicy",
-        player_env,
-        policy_kwargs=dict(features_extractor_class=PlayerExtractor),
-        verbose=1,
-    )
+    # --------- MODEL LOADING FROM CUSTOM PATH ----------
+    if player_resume_path is not None and os.path.isfile(player_resume_path):
+        print(f"Loading player policy from {player_resume_path}")
+        player_policy = PPO.load(player_resume_path, env=player_env, device="auto")
+    else:
+        print(f"Training player policy from scratch.")
+        player_policy = PPO(
+            "MultiInputPolicy",
+            player_env,
+            policy_kwargs=dict(features_extractor_class=PlayerExtractor),
+            verbose=1,
+        )
+
+    if host_resume_path is not None and os.path.isfile(host_resume_path):
+        print(f"Loading host model from {host_resume_path}")
+        host_policy.load_state_dict(torch.load(host_resume_path, map_location="cpu"))
+        print("Loaded host model.")
+    else:
+        print(f"Training host model from scratch.")
 
     base_env.reset()
-    round_count = 0
+    round_count = 0  # force start from 0
 
     while round_count < total_rounds:
         player_policy.learn(total_timesteps=1, reset_num_timesteps=False)
 
-        # After each full round, update host with REINFORCE loss
         if base_env.phase == Phase.BRIBE and player_env.last_host_logprob is not None:
             host_reward = base_env.hist_host_profit[-1]
             host_loss = -player_env.last_host_logprob * torch.tensor(host_reward, dtype=torch.float32)
@@ -202,13 +219,27 @@ def train(total_rounds=10000, save_every=20):
             round_count += 1
 
         if round_count % save_every == 0 and round_count > 0:
-            player_policy.save("./checkpoints/player_model.zip")
-            torch.save(host_policy.state_dict(), "./checkpoints/host_model.pt")
+            player_save_path = f"{ckpt_dir}/player_model_{round_count}.zip"
+            host_save_path = f"{ckpt_dir}/host_model_{round_count}.pt"
+            player_policy.save(player_save_path)
+            torch.save(host_policy.state_dict(), host_save_path)
             print(f"[Saved @ round {round_count}]")
 
-    player_policy.save("./checkpoints/player_model.zip")
-    torch.save(host_policy.state_dict(), "./checkpoints/host_model.pt")
+    player_save_path = f"{ckpt_dir}/player_model_{round_count}.zip"
+    host_save_path = f"{ckpt_dir}/host_model_{round_count}.pt"
+    player_policy.save(player_save_path)
+    torch.save(host_policy.state_dict(), host_save_path)
+    print(f"Training complete. Final checkpoint saved at round {round_count}")
 
 
 if __name__ == "__main__":
-    train()
+    # Usage: optionally pass the checkpoint paths manually here
+    player_ckpt = input("Enter player model path to resume (or leave blank): ").strip() or None
+    host_ckpt = input("Enter host model path to resume (or leave blank): ").strip() or None
+    train(
+        total_rounds=10000,
+        save_every=50,
+        ckpt_dir="./checkpoints",
+        player_resume_path=player_ckpt,
+        host_resume_path=host_ckpt,
+    )

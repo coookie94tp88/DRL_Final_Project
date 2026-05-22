@@ -97,8 +97,8 @@ def render_round_log(console: Console, env: OracleGambitEnv, rewards: dict, info
 if __name__ == "__main__":
     console = Console()
 
-    PLAYER_PATH = "player_model.zip"
-    HOST_PATH = "host_model.pt"
+    PLAYER_PATH = "./checkpoints/player_model_950.zip"
+    HOST_PATH = "./checkpoints/host_model_950.pt"
 
     config = OracleGambitConfig(
         num_players=10,
