@@ -1,213 +1,313 @@
-This Markdown is designed to serve as the official documentation for your GitHub repository. It defines the environment logic, the hierarchical decision process, and the technical specifications for the observations and states.
-
----
-
 # OracleGambit: Strategic Information Manipulation in Multi-Agent RL
 
-**OracleGambit** is a Multi-Agent Reinforcement Learning (MARL) environment designed to study the evolution of deceptive signaling, bribery, and information asymmetry. In this game, a "Host" (the Oracle) possesses ground-truth information but faces a financial conflict of interest with the "Players," leading to complex strategic dynamics.
+**OracleGambit** is a Multi-Agent Reinforcement Learning (MARL) environment that studies the emergence of deceptive signaling and trust dynamics. A single **Host** agent knows the ground truth and must decide whether to guide or deceive **N Player** agents, while Players must learn when to trust the Host's signal.
+
+> Submitted to **NTU-DRL-MiniConf 2026**
 
 ---
 
-## 1. Environment Dynamics: The 4-Door Game
+## Table of Contents
 
-The environment consists of **$N$ Players** and **1 Host**.
-
-* **The Setup:** There are **4 doors**, only one of which contains the reward.
-* **Initial Funds:** Each player starts with a fixed `INITIAL_BALANCE`.
-* **The Host:** The Host knows the correct door from the start. The Host has infinite liquidity but its objective is strictly to maximize its net profit (Total Loser Bets - Total Winner Payouts).
-* **The Payout Logic:** * If a player wins, they receive a payout.
-* If the total winning bets represent a **Minority (< 20% of total bets)**, the Host secures a profit.
-* If the winning bets represent a **Majority (≥ 20% of total bets)**, the Host incurs a loss (payouts exceed the pool of loser bets).
-* If a player loses all of its Balance, he can't participate the game last.
-
-
-
----
-
-## 2. Game Sequence (Two-Phase Decision)
-
-Each round follows a strict hierarchical sequence:
-
-### Phase I: The Bribery Stage
-
-1. **Bribery:** Every player simultaneously decides on a `Bribe_Amount` to offer the Host.
-2. **Signaling:** * The Host observes all bribes.
-* The Host broadcasts a **Public Signal** (a door number, potentially false).
-* The Host sends a **Private Signal** to each player. The accuracy/reliability of this signal is a learned strategy by the Host, influenced by the bribe amount.
-
-
-
-### Phase II: The Betting Stage
-
-1. **Action:** Players receive the signals and choose:
-* Which **Door** to pick (1-4).
-* How much to **Bet** (a portion of their current balance).
-
-
-2. **Settlement:** The correct door is revealed. Balances are updated, and the Host calculates its net profit/loss.
+1. [Game Overview](#1-game-overview)
+2. [Game Mechanics](#2-game-mechanics)
+3. [Reward Design](#3-reward-design)
+4. [Observation Space](#4-observation-space)
+5. [File Structure](#5-file-structure)
+6. [Installation](#6-installation)
+7. [Quick Start](#7-quick-start)
+8. [Training — Phase 1: MLP + REINFORCE](#8-training--phase-1-mlp--reinforce)
+9. [Tracked Metrics](#9-tracked-metrics)
+10. [Research Questions](#10-research-questions)
 
 ---
 
-## 3. Technical Specifications: Obs & States
+## 1. Game Overview
 
-To accommodate the **Transformer** architecture, all observations are structured as fixed-size buffers using **$-1$/None Padding** for future or empty steps.
+| Property | Value |
+|----------|-------|
+| Players  | N = 6 (default) |
+| Doors    | D = 4 |
+| Payout threshold θ | 0.20 |
+| History window L | 50 rounds |
+| Game type | **Zero-sum**, repeated, partially observable |
 
-If a player is out of the game(lose all of his balance), his state in last game presents by $0$ .
-
-### A. Global Parameters
-
-These constants define the constraints of the environment.
-
-| Parameter | Value | Description |
-| --- | --- | --- |
-| `NUM_PLAYERS` | 10 (Default) | Total number of participating agents. |
-| `NUM_DOORS` | 4 | Possible choices for the reward. |
-| `INITIAL_BALANCE` | 1000 | Starting capital for each player. |
-| `MINORITY_THRESHOLD` | 0.20 | Ratio of bets below which the Host profits. |
-| `HISTORY_WINDOW` | 50 | Number of past rounds stored in history. |
-
-### B. Player Observation Space
-
-Each player maintains a local buffer to capture the **POMDP** (Partially Observable Markov Decision Process) nature of the game.
-
-* **History (Fixed Size $L$):**
-* `Past_Choices`: Doors picked in previous rounds.
-* `Past_Signals`: Public/Private signals received.
-* `Past_Ratios`: The betting distribution across the 4 doors in previous rounds.
-
-
-* **Current Context:**
-* `Current_Balance`: Remaining funds.
-* `Step_1_Result`: The current bribe sent and the resulting signals (injected after the bribery phase).
-
-
-
-### C. Host State Space
-
-The Host has **Full Observability** of the market dynamics.
-
-* **Global History:** * Choices and balances of all players.
-* All signals (Public/Private) sent in the past.
-
-
-* **Market Status:** * Total bribes received in the current round.
-* Host’s cumulative profit/loss.
-* The correct door in currunt round.
-
-
+Each round consists of one Host and N Players. The Host secretly observes the correct door and emits a **public signal** (which may or may not be truthful). Players observe the signal and simultaneously pick a door. Rewards are distributed based on a dynamic payout multiplier.
 
 ---
 
-## 4. Reward Shaping
+## 2. Game Mechanics
 
-### For Players (The Agents)
+### Round Sequence
 
-$$R_{player} = \text{Payout} - \text{Bet_Lost} - \text{Bribe_Amount}$$
+```
+1. Environment draws correct_door  (hidden from Players)
+2. Host observes correct_door → outputs public_signal ∈ {0,1,2,3}
+3. Players observe public_signal → each picks a door ∈ {0,1,2,3}
+4. Settlement: compute win-ratio x, apply M(x), distribute rewards
+```
 
+### Action Spaces
 
-*Players must learn if the "Information Gain" from a bribe justifies its cost.*
+| Agent | Action | Range |
+|-------|--------|-------|
+| Host | Which door to signal | `{0, 1, 2, 3}` |
+| Player | Which door to pick | `{0, 1, 2, 3}` |
 
-### For the Host (The Oracle)
-
-$$R_{host} = \sum (\text{Loser_Bets}) - \sum (\text{Winner_Payouts}) + \sum (\text{Bribes})$$
-
-
-*The Host must balance "Credibility" (giving true signals to attract bribes) against "Survival" (misleading players to avoid majority payouts).*
-
----
-
-## 5. Model Architecture: Hierarchical Transformer
-
-The agents utilize a **Hierarchical Transformer Encoder**.
-
-1. **Feature Embedding:** Converts history and signals into high-dimensional vectors.
-2. **Self-Attention (`nhead=8`):** Identifies correlations between bribe amounts and Host honesty over time.
-3. **Dual-Stage Heads:**
-* **Bidding Head:** Outputs the `Bribe_Amount`.
-* **Betting Head:** Conditioned on the signal received, outputs the `Door` and `Bet_Amount`.
-
-
+All agents have **fixed bet size = 1 unit** per round (no variable betting).
 
 ---
 
-## 6. Research Objectives
+## 3. Reward Design
 
-* **Evolution of Trust:** Do players learn to ignore the Host if the Host becomes too predatory?
-* **Market Manipulation:** Will the Host learn to favor high-bribing players to create a "loyal minority"?
-* **Cross-Play Evaluation:** Testing "Naive Players" (from early training) against "Sophisticated Hosts" (from late training) to measure the exploitability of information.
+The reward system is a **dynamic odds game**. The more players win, the lower each winner's payout — discouraging blind herding.
 
-This section defines the core economic engine of your environment. It ensures that the **Host** acts as a "Market Maker" with a specific risk threshold at **25%**, and that the **Players** face diminishing returns as a choice becomes "crowded."
+### Definitions
 
----
+| Symbol | Definition |
+|--------|-----------|
+| N | Total number of players |
+| W | Number of players who picked the correct door |
+| x = W/N | Win ratio |
+| θ = 0.20 | Host break-even threshold |
+| M(x) | Dynamic payout multiplier |
 
-## 7. Payout & Reward Mechanism
+### Payout Multiplier
 
-The reward system is designed as a **Dynamic Odds Game**. Unlike a fixed-multiplier bet (e.g., 1:2), the payout per winning player is inversely proportional to the total winning volume, creating a "Slippage" effect.
+$$M(x) = 1 + \frac{1 - \theta}{x}, \quad x > 0$$
 
-### A. Mathematical Definitions
+Returns `0` when `x = 0` (no winners).
 
-* **$P$ (Total Pool):** The sum of all bets placed by all players in the current round.
-* **$W$ (Winning Volume):** The sum of all bets placed on the **correct** door.
-* **$x$ (Winning Ratio):** The percentage of the total pool that won ($x = \frac{W}{P}$).
-* **$M(x)$ (Payout Multiplier):** The factor by which a winner's bet is multiplied.
+### Player Reward
 
-### B. The Payout Formula
+$$r_{\text{player}} = \begin{cases} M(x) - 1 = \dfrac{1-\theta}{x} & \text{winner} \\[6pt] -1 & \text{loser} \end{cases}$$
 
-To satisfy the requirement that the Host breaks even at $x = 20\%$, the individual payout for a winning bet $b_i$ is calculated as:
+### Host Reward
 
-$$\text{Payout}_i = b_i \times \left( 1 + \frac{0.8}{x} \right)$$
+$$r_{\text{host}} = N - W \cdot M(x) = N \cdot (\theta - x)$$
 
-> **Why this formula?**
-> * **Inverse Proportionality:** As the winning ratio $x$ increases, the multiplier $\frac{0.75}{x}$ decreases.
-> * **Threshold Dynamics:** At exactly $x = 0.2$ (20%), the total payout becomes $W \times (1 + \frac{0.8}{0.2}) = W \times 5$. Since $W$ is $20\%$ of $P$, $5 \times 0.2P = P$. The Host pays out exactly what was collected (Break-even).
-> 
-> 
+- `x < θ` → Host profits
+- `x = θ` → Break-even
+- `x > θ` → Host loses
 
----
+### Zero-Sum Verification
 
-### C. Host Net Profit/Loss
+$$\underbrace{W \cdot \frac{1-\theta}{x}}_{\text{winners}} + \underbrace{(N-W)\cdot(-1)}_{\text{losers}} + \underbrace{N(\theta - x)}_{\text{host}} = 0 \checkmark$$
 
-The Host’s financial outcome per round ($R_{host}$) is determined by the total betting pool minus the total payouts:
+### Reward Table (N = 6, θ = 0.20)
 
-$$R_{host} = P - \sum (\text{Payouts}) + \sum (\text{Bribes})$$
-
-#### Strategic Scenarios:
-
-| Winner Ratio ($x$) | Payout Multiplier | Host Outcome | Scenario Description |
-| --- | --- | --- | --- |
-| **10% (Minority)** | **9x** | **Profit (+0.1P)** | High reward for winners; Host collects surplus from losers. |
-| **20% (Threshold)** | **5.0x** | **Break-even (0)** | Total payouts equal the total betting pool. |
-| **50% (Majority)** | **2.6x** | **Loss (-0.3P)** | Winners receive less; Host must pay the difference from their own pocket. |
+| Winners W | x | Winner reward | Host reward |
+|-----------|---|--------------|-------------|
+| 0 | 0.00 | — | **+6.0** (max) |
+| 1 | 0.17 | **+3.8** | +0.2 |
+| 2 | 0.33 | +1.4 | −0.8 |
+| 3 | 0.50 | +0.6 | −1.8 |
+| 6 | 1.00 | −0.2 | −4.8 |
 
 ---
 
-### D. Observation Mapping for Transformer
+## 4. Observation Space
 
-To allow the Agent's **Transformer** to detect these patterns, the following data points are injected into the history buffer:
+Both agents receive a **flat vector** containing a sliding history window plus the current-round context. Phase 1 (MLP) and Phase 2 (Transformer) use the **same observation**, making the two architectures directly comparable.
 
-1. **Relative Crowding:** The ratio of betting volume on each door from the previous 5 steps.
-2. **Host Payout Pressure:** A scalar representing how much the Host lost or gained in the previous round.
-3. **Bribe-to-Signal Correlation:** A feature mapping the `Bribe_Amount` to the `Multiplier` received, allowing the agent to learn if the Host is "selling" entry into a minority or majority group.
+### Player Observation — 455 dims
 
-### E. Implementation Parameters
+```
+[ history  (L × 8)  ]  50 × 8  = 400  dims
+[ attn mask (L)     ]          =  50  dims
+[ current context   ]  D+1     =   5  dims
+─────────────────────────────────────────
+                          total = 455  dims
+```
 
-Add these to your `parameters` section for the environment:
+**Per-timestep history features (8):**
 
-```python
-# Payout Constants
-PAYOUT_THRESHOLD = 0.25  # The break-even point (25%)
-SURPLUS_COEFFICIENT = 1 - PAYOUT_THRESHOLD  # 0.75
+| Feature | Description |
+|---------|-------------|
+| `door_choice / (D-1)` | Normalised door this player picked |
+| `public_signal / (D-1)` | Normalised signal from Host |
+| `followed_signal` | 1 if player followed the signal |
+| `won` | 1 if player won |
+| `door_ratio[0..3]` | Fraction of all players on each door |
 
-def calculate_payout(individual_bet, total_winning_vol, total_pool):
-    x = total_winning_vol / total_pool
-    multiplier = 1 + (SURPLUS_COEFFICIENT / x)
-    return individual_bet * multiplier
+**Current context (5):** `public_signal` one-hot (4) + `round_frac` (1)
 
+### Host Observation — 255 dims
+
+```
+[ history  (L × 4)  ]  50 × 4  = 200  dims
+[ attn mask (L)     ]          =  50  dims
+[ current context   ]  D+1     =   5  dims
+─────────────────────────────────────────
+                          total = 255  dims
+```
+
+**Per-timestep history features (4):**
+
+| Feature | Description |
+|---------|-------------|
+| `correct_door / (D-1)` | Normalised true door |
+| `public_signal / (D-1)` | Signal Host emitted |
+| `signal_honest` | 1 if signal == correct_door |
+| `win_ratio` | x = W/N that round |
+
+**Current context (5):** `correct_door` one-hot (4) + `round_frac` (1)
+
+> **Attention mask:** 1 for valid timesteps, 0 for padding (first L rounds). Used by the Transformer in Phase 2.
+
+---
+
+## 5. File Structure
+
+```
+b12902145/
+├── env/
+│   ├── oracle_gambit_env.py   # Core MARL environment (PettingZoo AECEnv)
+│   ├── verify_env.py          # 5-group mathematical verification (all pass)
+│   └── watch_random.py        # Colorful terminal visualisation
+│
+├── agents/
+│   └── mlp_agent.py           # MLP policy: obs → Categorical(D doors)
+│
+├── training/
+│   └── reinforce_runner.py    # REINFORCE + EMA baseline training loop
+│
+├── experiments/
+│   └── run_mlp_baseline.py    # Phase 1 entry point (CLI)
+│
+├── checkpoints/               # Saved model weights (.pt)
+├── requirements.txt
+└── README.md
 ```
 
 ---
 
-## 8. Expected Behavioral Evolutions
+## 6. Installation
 
-1. **Host Manipulation:** The Host will learn that providing **too much** accurate information leads to $x > 25\%$, causing a loss. To survive, the Host must "distribute" false signals or lead different players to different doors to keep $x$ near or below $25\%$.
-2. **Player Skepticism:** Players will observe that if "Everyone seems to be betting on Door 1," the payout multiplier will crash ($x$ increases), and the Host's incentive to lie increases. The Transformer should attend to "Betting Ratios" as a signal of **Host Deception Risk**.
+```bash
+# Python 3.10 or 3.11 recommended
+pip install -r requirements.txt
+```
+
+**requirements.txt:**
+
+```
+numpy>=1.26
+gymnasium>=1.0
+pettingzoo>=1.24
+torch>=2.2
+tensorboard>=2.16
+matplotlib>=3.8
+```
+
+---
+
+## 7. Quick Start
+
+### Visualise random agents
+
+```bash
+python env/watch_random.py --rounds 20 --players 6 --seed 42
+```
+
+### Run environment verification (5/5 tests)
+
+```bash
+python env/verify_env.py
+```
+
+### Use the environment directly
+
+```python
+from env.oracle_gambit_env import OracleGambitEnv
+
+env = OracleGambitEnv(num_players=6, num_doors=4, seed=42)
+env.reset()
+
+host_action   = 0.33   # float in [0,1] → mapped to door index
+player_action = {"player_0": 0.33, "player_1": 0.67, ...}
+
+rewards = env.step_all(host_action, player_action)
+# returns {"host": float, "player_0": float, ..., "player_5": float}
+```
+
+---
+
+## 8. Training — Phase 1: MLP + REINFORCE
+
+### Architecture
+
+```
+obs (455 or 255 dims)
+  └─ Linear(obs_dim, 256) + Tanh
+       └─ Linear(256, 128) + Tanh
+            └─ Linear(128, 4)  ← logits over D doors
+                 └─ Categorical → sample door index
+```
+
+- **Host agent** and **Player agent** are separate networks.
+- All 6 players **share one network** (parameter sharing → 6× sample efficiency).
+
+### Algorithm: REINFORCE with EMA Baseline
+
+$$\mathcal{L} = -\mathbb{E}\left[(r - b)\cdot\log\pi(a\mid o)\right] - \beta\cdot H[\pi]$$
+
+| Symbol | Value |
+|--------|-------|
+| Baseline $b$ | EMA of batch rewards, momentum α = 0.99 |
+| Entropy coeff $\beta$ | 0.01 |
+| Optimiser | Adam, lr = 3×10⁻⁴ |
+| Batch size | 128 rounds per update |
+| Grad clip | L2 norm ≤ 1.0 |
+
+> **No replay buffer** — REINFORCE is on-policy; each batch is collected fresh and discarded after one update.
+
+### Two-Phase Observation (critical detail)
+
+Players must see the Host's signal **before** choosing a door. The runner handles this as:
+
+```
+1. host.act(obs)              → door_h  (= public_signal)
+2. env._public_signal = door_h          (expose signal early)
+3. player_i.act(env.observe(player_i))  (obs now contains door_h)
+4. env.step_all(door_h, player_doors)   (step re-derives same door_h)
+```
+
+### Run training
+
+```bash
+# Default: 100,000 rounds, 6 players
+python experiments/run_mlp_baseline.py
+
+# Quick smoke test
+python experiments/run_mlp_baseline.py --rounds 2000
+
+# Custom settings
+python experiments/run_mlp_baseline.py \
+    --rounds 200000 --players 6 --lr 1e-3 --entropy_coeff 0.05
+```
+
+Checkpoints are saved to `checkpoints/mlp_reinforce/` and a training curve PNG is generated on completion.
+
+---
+
+## 9. Tracked Metrics
+
+| Metric | Symbol | Meaning |
+|--------|--------|---------|
+| Host reward | H | Avg host reward per round (positive = host winning) |
+| Player reward | P | Avg player reward per round |
+| Win ratio | wr | Avg fraction of players who won (random baseline ≈ 0.25) |
+| Signal honesty | hon | Fraction of rounds where signal == correct_door |
+| Follow rate | fol | Fraction of players who followed the signal |
+
+---
+
+## 10. Research Questions
+
+1. **Trust equilibrium** — Do players learn to distrust a deceptive host? Does the host adapt by becoming more honest?
+
+2. **Nash Equilibrium convergence** — Theory predicts a mixed-strategy equilibrium at some honesty rate $p^*$ and follow rate $q^*$. Does self-play converge near it?
+
+3. **Architecture comparison (Phase 1 vs Phase 2)** — Can a Transformer (with explicit attention over the history) learn faster or converge to a better equilibrium than the MLP baseline?
+
+4. **Herding and anti-herding** — Does the host learn to exploit players who blindly follow signals, creating a "loyal herd" that keeps $x$ low?
