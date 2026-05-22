@@ -339,10 +339,17 @@ class OracleGambitEnv(AECEnv):
             else:
                 rewards[name] = -1.0
 
-        # Host profit = pool − total payout.  Works for W=0 edge case too:
+        # Host profit = pool − total payout.
         #   W>0: N - W*M = N - N*x*(1+(1-θ)/x) = N*(θ-x)
-        #   W=0: N - 0   = N  (host keeps everything)
-        rewards["host"] = float(N) - float(W) * M
+        #   W=0: cap at N*θ (not the full pool) so players can punish host by
+        #        ignoring signals.  Without this cap, E[H|random_players] ≈ +0.55
+        #        and the host has no incentive to develop any real strategy.
+        #        With cap: E[H|random_players] = N*(θ-1/D) < 0 when θ < 1/D,
+        #        forcing the host to actively maintain signal credibility.
+        if W == 0:
+            rewards["host"] = float(N) * θ
+        else:
+            rewards["host"] = float(N) - float(W) * M
         self._host_cumulative_reward += rewards["host"]
         return rewards
 

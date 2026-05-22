@@ -147,11 +147,12 @@ class ReinforceRunner:
         act_t: torch.Tensor,
         rew_t: torch.Tensor,
         baseline: float,
-    ) -> tuple[torch.Tensor, float]:
+    ) -> tuple[torch.Tensor, float, float]:
         """
         Compute REINFORCE loss and update the EMA baseline.
 
         loss = -mean[(r - b) · log π(a|o)] - β · mean[H[π]]
+        Returns (loss, new_baseline, mean_entropy).
         """
         new_baseline = (
             self.baseline_momentum * baseline
@@ -161,7 +162,7 @@ class ReinforceRunner:
 
         log_probs, entropy = agent.evaluate(obs_t, act_t)
         loss = -(advantage * log_probs).mean() - self.entropy_coeff * entropy.mean()
-        return loss, new_baseline
+        return loss, new_baseline, float(entropy.mean().item())
 
     def _update(self, batch: dict) -> dict:
         # ── Host ─────────────────────────────────────────────────────────
@@ -170,7 +171,7 @@ class ReinforceRunner:
         h_act_t = torch.LongTensor(h["action"])
         h_rew_t = torch.FloatTensor(h["reward"])
 
-        h_loss, self.host_baseline = self._reinforce_loss(
+        h_loss, self.host_baseline, h_ent = self._reinforce_loss(
             self.host_agent, h_obs_t, h_act_t, h_rew_t, self.host_baseline
         )
         self.host_opt.zero_grad()
@@ -184,7 +185,7 @@ class ReinforceRunner:
         p_act_t = torch.LongTensor(p["action"])
         p_rew_t = torch.FloatTensor(p["reward"])
 
-        p_loss, self.player_baseline = self._reinforce_loss(
+        p_loss, self.player_baseline, p_ent = self._reinforce_loss(
             self.player_agent, p_obs_t, p_act_t, p_rew_t, self.player_baseline
         )
         self.player_opt.zero_grad()
@@ -193,8 +194,10 @@ class ReinforceRunner:
         self.player_opt.step()
 
         return {
-            "host_loss":   float(h_loss.item()),
-            "player_loss": float(p_loss.item()),
+            "host_loss":     float(h_loss.item()),
+            "player_loss":   float(p_loss.item()),
+            "host_entropy":  h_ent,
+            "player_entropy": p_ent,
         }
 
     # ------------------------------------------------------------------
@@ -243,46 +246,121 @@ class ReinforceRunner:
         batch_size: int = 128,
         log_interval: int = 2_000,
         save_interval: int = 20_000,
+        spotlight_interval: int = 10_000,
         save_dir: str = "checkpoints/mlp_reinforce",
     ) -> list[dict]:
         """
         Run REINFORCE training.
 
+        Saves a CSV log to  <save_dir>/training_log.csv  every log_interval.
+        Prints a round-level spotlight every spotlight_interval rounds.
+
         Returns
         -------
         log : list[dict]  — one entry per log_interval rounds
         """
+        import csv as _csv
+
+        _CSV_FIELDS = [
+            "round", "host_reward", "player_reward", "win_ratio",
+            "signal_honesty", "follow_rate",
+            "host_loss", "player_loss", "host_entropy", "player_entropy",
+            "host_baseline", "player_baseline", "elapsed_s",
+        ]
+
         os.makedirs(save_dir, exist_ok=True)
+        csv_path = os.path.join(save_dir, "training_log.csv")
         self.env.reset()
 
         log: list[dict] = []
         rounds_done = 0
         t0 = time.time()
+        recent_metrics: list[dict] = []  # ring-buffer for spotlight
 
-        while rounds_done < total_rounds:
-            batch = self._collect_batch(batch_size)
-            losses = self._update(batch)
-            metrics = self._agg_metrics(batch["metrics"])
-            rounds_done += batch_size
+        with open(csv_path, "w", newline="") as csv_f:
+            writer = _csv.DictWriter(csv_f, fieldnames=_CSV_FIELDS,
+                                     extrasaction="ignore")
+            writer.writeheader()
 
-            if rounds_done % log_interval < batch_size:
-                elapsed = time.time() - t0
-                entry = {
-                    "round":          rounds_done,
-                    **metrics,
-                    **losses,
-                    "host_baseline":   self.host_baseline,
-                    "player_baseline": self.player_baseline,
-                    "elapsed_s":       elapsed,
-                }
-                log.append(entry)
-                _print_log(entry)
+            while rounds_done < total_rounds:
+                batch   = self._collect_batch(batch_size)
+                losses  = self._update(batch)
+                metrics = self._agg_metrics(batch["metrics"])
+                rounds_done += batch_size
 
-            if rounds_done % save_interval < batch_size:
-                _save_checkpoints(self, save_dir, rounds_done)
+                # Keep up to 20 recent rounds for spotlight
+                recent_metrics.extend(batch["metrics"])
+                if len(recent_metrics) > 20:
+                    recent_metrics = recent_metrics[-20:]
+
+                if rounds_done % log_interval < batch_size:
+                    elapsed = time.time() - t0
+                    entry = {
+                        "round":           rounds_done,
+                        **metrics,
+                        **losses,
+                        "host_baseline":   self.host_baseline,
+                        "player_baseline": self.player_baseline,
+                        "elapsed_s":       elapsed,
+                    }
+                    log.append(entry)
+                    writer.writerow(entry)
+                    csv_f.flush()
+                    _print_log(entry)
+
+                if spotlight_interval > 0 and rounds_done % spotlight_interval < batch_size:
+                    self._print_spotlight(recent_metrics)
+
+                if rounds_done % save_interval < batch_size:
+                    _save_checkpoints(self, save_dir, rounds_done)
 
         print(f"\nDone. {rounds_done} rounds in {time.time()-t0:.1f}s")
+        print(f"Log  → {csv_path}")
         return log
+
+    @staticmethod
+    def _print_spotlight(metrics_list: list[dict], n: int = 5) -> None:
+        """
+        Print the last n rounds as a table for qualitative inspection.
+
+        Choices column markers:
+          [d]* = player chose the correct door  (green)
+          [d]~ = player followed signal (wrong) (yellow)
+           d   = player picked some other door
+        """
+        C, G, R, Y, RST = "\033[96m", "\033[92m", "\033[91m", "\033[93m", "\033[0m"
+        recent = metrics_list[-n:]
+        if not recent:
+            return
+
+        def _mark(c: int, cd: int, sig: int) -> str:
+            if c == cd:
+                return f"{G}{c}*{RST}"
+            if c == sig:
+                return f"{Y}{c}~{RST}"
+            return f"{c} "
+
+        print(f"\n{C}{'━'*24} Spotlight (last {len(recent)} rounds) {'━'*6}{RST}")
+        print(f"  {'Round':>7}  {'Corr':^4}  {'Sig':^3}  {'Hon':^3}  "
+              f"{'Choices  (*=correct ~=signal)':<32}  {'Fol':>4}  {'x':>5}  {'H-Rwd':>7}")
+        print(f"  {'─'*78}")
+        for m in recent:
+            cd      = m["correct_door"]
+            sig     = m["public_signal"]
+            honest  = (cd == sig)
+            choices = list(m["door_choices"].values())
+            n_fol   = sum(1 for c in choices if c == sig)
+            fol_r   = n_fol / len(choices) if choices else 0.0
+            x       = m["win_ratio"]
+            hr      = m["rewards"]["host"]
+            hc      = G if hr >= 0 else R
+            hon_s   = f"{G}Y{RST}" if honest else f"{R}N{RST}"
+            ch_s    = " ".join(_mark(c, cd, sig) for c in choices)
+            print(
+                f"  {m['round']:>7}  {cd:^4}  {Y}{sig:^3}{RST}  {hon_s}   "
+                f"{ch_s}   {fol_r:>4.2f}  {x:>5.3f}  {hc}{hr:>+7.2f}{RST}"
+            )
+        print(f"{C}{'━'*80}{RST}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -290,18 +368,22 @@ class ReinforceRunner:
 # ---------------------------------------------------------------------------
 
 def _print_log(e: dict) -> None:
-    G, R, RST = "\033[92m", "\033[91m", "\033[0m"
+    G, R, D, RST = "\033[92m", "\033[91m", "\033[2m", "\033[0m"
     hr = e["host_reward"]
     pr = e["player_reward"]
     hc = G if hr >= 0 else R
     pc = G if pr >= 0 else R
+    h_ent  = e.get("host_entropy",   float("nan"))
+    p_ent  = e.get("player_entropy", float("nan"))
+    h_loss = e.get("host_loss",      float("nan"))
+    p_loss = e.get("player_loss",    float("nan"))
     print(
         f"[{e['round']:>8}]  "
-        f"H={hc}{hr:+.3f}{RST}  "
-        f"P={pc}{pr:+.3f}{RST}  "
+        f"H={hc}{hr:+.3f}{RST}  P={pc}{pr:+.3f}{RST}  "
         f"wr={e['win_ratio']:.3f}  "
-        f"hon={e['signal_honesty']:.2f}  "
-        f"fol={e['follow_rate']:.2f}  "
+        f"hon={e['signal_honesty']:.2f}  fol={e['follow_rate']:.2f}  "
+        f"{D}loss=({h_loss:.3f},{p_loss:.3f})  "
+        f"ent=({h_ent:.3f},{p_ent:.3f}){RST}  "
         f"({e['elapsed_s']:.0f}s)"
     )
 
