@@ -30,6 +30,64 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+TARGET_Q_CLAMP = 2000.0
+REWARD_CLAMP = 500.0
+
+
+def sanitize_state(state_flat: torch.Tensor) -> torch.Tensor:
+    return torch.nan_to_num(state_flat, nan=0.0, posinf=1.0, neginf=-1.0)
+
+
+def flatten_obs_safe(obs_dict, device="cpu") -> torch.Tensor:
+    return sanitize_state(flatten_obs_player(obs_dict, device))
+
+
+def clamp_rewards_np(arr: np.ndarray) -> np.ndarray:
+    return np.clip(np.nan_to_num(arr, nan=0.0, posinf=REWARD_CLAMP, neginf=-REWARD_CLAMP), -REWARD_CLAMP, REWARD_CLAMP)
+
+
+def module_has_nan(module: nn.Module) -> bool:
+    return any(not torch.isfinite(p).all() for p in module.parameters())
+
+
+def reinit_linear_modules(*modules: nn.Module) -> None:
+    for module in modules:
+        for layer in module.modules():
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=0.5)
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0.0)
+
+
+def recover_nan_player_networks(
+    actor1, actor2, critic1, critic2, critic1_target, critic2_target
+) -> None:
+    """Reinitialize all player SAC nets if any weight is non-finite."""
+    reinit_linear_modules(actor1, actor2, critic1, critic2)
+    critic1_target.load_state_dict(critic1.state_dict())
+    critic2_target.load_state_dict(critic2.state_dict())
+    print("⚠️  Reset player SAC networks (actors + critics) due to NaN/Inf.")
+
+
+def safe_opt_step(
+    loss: torch.Tensor,
+    optimizer: optim.Optimizer,
+    parameters,
+    grad_clip_norm: float,
+) -> bool:
+    if not torch.isfinite(loss):
+        optimizer.zero_grad(set_to_none=True)
+        return False
+    optimizer.zero_grad()
+    loss.backward()
+    grad_norm = torch.nn.utils.clip_grad_norm_(parameters, grad_clip_norm)
+    if not torch.isfinite(grad_norm):
+        optimizer.zero_grad(set_to_none=True)
+        return False
+    optimizer.step()
+    return True
+
+
 class TransformerExtractor(nn.Module):
     def __init__(self, curr_dim=CURR_DIM, hist_dim=HIST_DIM, d_model=128, nhead=4, num_layers=2, seq_len=SEQ_LEN):
         super().__init__()
@@ -67,7 +125,12 @@ class BribeActor(nn.Module):
         return mu, log_std
 
     def sample(self, state_flat):
+        state_flat = sanitize_state(state_flat)
         mu, log_std = self.forward(state_flat)
+        if not torch.isfinite(mu).all():
+            mu = torch.zeros_like(mu)
+        if not torch.isfinite(log_std).all():
+            log_std = torch.zeros_like(log_std)
         std = log_std.exp()
         dist = Normal(mu, std)
         x_t = dist.rsample()
@@ -90,8 +153,11 @@ class BetActor(nn.Module):
         self.bet_log_std_layer = nn.Linear(256, 1)
 
     def sample(self, state_flat):
+        state_flat = sanitize_state(state_flat)
         curr_enc, hist_enc = encode_features(state_flat)
         feat = self.extractor(curr_enc, hist_enc)
+        if not torch.isfinite(feat).all():
+            feat = torch.nan_to_num(feat, nan=0.0, posinf=0.0, neginf=0.0)
 
         belief_logits = self.belief_logits_layer(feat)
         belief_one_hot = F.gumbel_softmax(belief_logits, tau=self.gumbel_tau, hard=True)
@@ -260,8 +326,11 @@ def shape_player_rewards(
     diversity_bonus: float,
     eps: float,
 ) -> np.ndarray:
-    private_is_truth = (private_signals == winning_door).astype(np.float32)
-    follow_private = (beliefs == PlayerBelief.BELIEVE_PRIVATE).astype(np.float32)
+    has_private = (private_signals >= 0).astype(np.float32)
+    private_is_truth = ((private_signals == winning_door).astype(np.float32) * has_private)
+    follow_private = (
+        (beliefs == PlayerBelief.BELIEVE_PRIVATE).astype(np.float32) * has_private
+    )
     crowd = door_crowding_ratios(chosen_doors, bets, num_doors, eps)
 
     shaped = (
@@ -337,6 +406,7 @@ def train_both(
     batch_size=256,
     save_every_episodes=50,
     num_doors=4,
+    player_sac_alpha=0.01,
 ):
     set_seed(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -356,7 +426,6 @@ def train_both(
     bribe_log_std_min, bribe_log_std_max = -5.0, 1.0
     bet_log_std_min, bet_log_std_max = -5.0, 1.0
     bet_gumbel_tau = 0.8
-    player_sac_alpha = 0.10
     p_gamma1, p_gamma2, p_tau = 0.3, 0.99, 0.005
     grad_clip_norm = 1.0
     phases_per_round_estimate = 4
@@ -428,7 +497,10 @@ def train_both(
     r1_np = None
     bribe_frac = None
 
-    print("🔥 Co-training (belief SAC + host RDQN)")
+    print(
+        f"🔥 Co-training (belief SAC + host RDQN) | player_sac_alpha={player_sac_alpha} "
+        f"(env still uses actor.sample(); lower alpha = less entropy regularization)"
+    )
     while bet_steps < total_bet_steps:
         loop_iters += 1
         if loop_iters > max_loop_iters:
@@ -439,7 +511,21 @@ def train_both(
 
         if env.phase == Phase.BRIBE:
             s1_dict = obs["players"]
-            s1_tensor = flatten_obs_player(s1_dict, device)
+            s1_tensor = flatten_obs_safe(s1_dict, device)
+            if (
+                module_has_nan(player_actor1)
+                or module_has_nan(player_actor2)
+                or module_has_nan(player_critic1)
+                or module_has_nan(player_critic2)
+            ):
+                recover_nan_player_networks(
+                    player_actor1,
+                    player_actor2,
+                    player_critic1,
+                    player_critic2,
+                    player_critic1_target,
+                    player_critic2_target,
+                )
             with torch.no_grad():
                 bribe_frac, _ = player_actor1.sample(s1_tensor)
             bribe_action_np = bribe_frac.cpu().numpy().flatten()
@@ -452,7 +538,7 @@ def train_both(
             trust_bribe_rebate = (
                 player_trust_profit_bribe_rebate * prev_round_trust_profit_mask * current_bribes_np
             )
-            r1_np = -current_bribes_np + trust_bribe_rebate
+            r1_np = clamp_rewards_np(-current_bribes_np + trust_bribe_rebate)
 
         elif env.phase == Phase.SIGNAL:
             curr_tensor, hist_tensor = process_host_obs(env, device=device)
@@ -480,7 +566,6 @@ def train_both(
                 "public_signal": pub_act,
                 "private_signals": np.array(priv_acts, dtype=np.int32),
             }
-            last_private_signals = host_action["private_signals"].copy()
             prev_host_curr = curr_tensor
             prev_host_hist = hist_tensor
             prev_host_action = host_action
@@ -488,11 +573,17 @@ def train_both(
             winning_door = env.current_winning_door
             if winning_door >= 0:
                 ep_pub_truth_rate_sum += float(pub_act == winning_door)
-                ep_priv_truth_rate_sum += float(np.mean(np.array(priv_acts) == winning_door))
+                bribed_mask = env.current_bribes > 0
+                if np.any(bribed_mask):
+                    priv_arr = np.array(priv_acts, dtype=np.int32)
+                    ep_priv_truth_rate_sum += float(
+                        np.mean(priv_arr[bribed_mask] == winning_door)
+                    )
                 ep_signal_steps += 1
 
             obs, _, _, _, _ = env.step(host_action)
-            s2_tensor = flatten_obs_player(obs["players"], device)
+            last_private_signals = env.current_private_signals.copy()
+            s2_tensor = flatten_obs_safe(obs["players"], device)
 
         elif env.phase == Phase.BET:
             with torch.no_grad():
@@ -553,9 +644,9 @@ def train_both(
                 * (rewards["players"] > 0.0).astype(np.float32)
             )
             ep_trust_profit_rate_sum += float(np.mean(prev_round_trust_profit_mask))
-            r2_np = shaped_player_rewards - r1_np
+            r2_np = clamp_rewards_np(shaped_player_rewards - r1_np)
 
-            s1_next_tensor = flatten_obs_player(next_obs["players"], device)
+            s1_next_tensor = flatten_obs_safe(next_obs["players"], device)
             done_arr = np.full(
                 (config.num_players, 1), float(terminated or truncated), dtype=np.float32
             )
@@ -580,49 +671,45 @@ def train_both(
                 )
                 a2 = torch.cat([a2_belief, a2_bet], dim=-1)
 
+                s1 = sanitize_state(s1)
+                s2 = sanitize_state(s2)
+                s1_next = sanitize_state(s1_next)
+
                 with torch.no_grad():
                     next_a1, next_log_pi1 = player_actor1.sample(s1_next)
                     tq1a, tq1b = player_critic1_target(s1_next, next_a1)
                     target_v1 = torch.min(tq1a, tq1b) - player_sac_alpha * next_log_pi1
-                    target_q2 = r2 + p_gamma1 * (1 - done) * target_v1
+                    target_q2 = torch.clamp(
+                        r2 + p_gamma1 * (1 - done) * target_v1, -TARGET_Q_CLAMP, TARGET_Q_CLAMP
+                    )
 
                 cq2a, cq2b = player_critic2(s2, a2)
                 q2_loss = F.mse_loss(cq2a, target_q2) + F.mse_loss(cq2b, target_q2)
-                p_opt_c2.zero_grad()
-                q2_loss.backward()
-                torch.nn.utils.clip_grad_norm_(player_critic2.parameters(), grad_clip_norm)
-                p_opt_c2.step()
+                safe_opt_step(q2_loss, p_opt_c2, player_critic2.parameters(), grad_clip_norm)
 
                 with torch.no_grad():
                     _, next_belief_oh, next_bet, next_log_pi2 = player_actor2.sample(s2)
                     next_a2 = torch.cat([next_belief_oh, next_bet], dim=-1)
                     tq2a, tq2b = player_critic2_target(s2, next_a2)
                     target_v2 = torch.min(tq2a, tq2b) - player_sac_alpha * next_log_pi2
-                    target_q1 = r1 + p_gamma2 * target_v2
+                    target_q1 = torch.clamp(
+                        r1 + p_gamma2 * target_v2, -TARGET_Q_CLAMP, TARGET_Q_CLAMP
+                    )
 
                 cq1a, cq1b = player_critic1(s1, a1)
                 q1_loss = F.mse_loss(cq1a, target_q1) + F.mse_loss(cq1b, target_q1)
-                p_opt_c1.zero_grad()
-                q1_loss.backward()
-                torch.nn.utils.clip_grad_norm_(player_critic1.parameters(), grad_clip_norm)
-                p_opt_c1.step()
+                safe_opt_step(q1_loss, p_opt_c1, player_critic1.parameters(), grad_clip_norm)
 
                 _, curr_belief_oh, curr_bet, log_pi2 = player_actor2.sample(s2)
                 curr_a2 = torch.cat([curr_belief_oh, curr_bet], dim=-1)
                 q2_pi_a, q2_pi_b = player_critic2(s2, curr_a2)
                 a2_loss = (player_sac_alpha * log_pi2 - torch.min(q2_pi_a, q2_pi_b)).mean()
-                p_opt_a2.zero_grad()
-                a2_loss.backward()
-                torch.nn.utils.clip_grad_norm_(player_actor2.parameters(), grad_clip_norm)
-                p_opt_a2.step()
+                safe_opt_step(a2_loss, p_opt_a2, player_actor2.parameters(), grad_clip_norm)
 
                 curr_a1, log_pi1 = player_actor1.sample(s1)
                 q1_pi_a, q1_pi_b = player_critic1(s1, curr_a1)
                 a1_loss = (player_sac_alpha * log_pi1 - torch.min(q1_pi_a, q1_pi_b)).mean()
-                p_opt_a1.zero_grad()
-                a1_loss.backward()
-                torch.nn.utils.clip_grad_norm_(player_actor1.parameters(), grad_clip_norm)
-                p_opt_a1.step()
+                safe_opt_step(a1_loss, p_opt_a1, player_actor1.parameters(), grad_clip_norm)
 
                 for p, tp in zip(player_critic1.parameters(), player_critic1_target.parameters()):
                     tp.data.copy_(p_tau * p.data + (1 - p_tau) * tp.data)
@@ -734,6 +821,12 @@ if __name__ == "__main__":
     parser.add_argument("--total-bet-steps", type=int, default=120000)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--save-every-episodes", type=int, default=50)
+    parser.add_argument(
+        "--sac-alpha",
+        type=float,
+        default=0.01,
+        help="SAC entropy coefficient for player actors (0 = off; default 0.01 avoids dominating shaping)",
+    )
     args = parser.parse_args()
     train_both(
         seed=args.seed,
@@ -741,4 +834,5 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         save_every_episodes=args.save_every_episodes,
         num_doors=args.num_doors,
+        player_sac_alpha=args.sac_alpha,
     )

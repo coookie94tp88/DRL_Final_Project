@@ -29,14 +29,16 @@ Each round follows a strict hierarchical sequence:
 
 ### Phase I: Bribery (`Phase.BRIBE`)
 
-1. **Bribery:** Every alive player simultaneously submits a **bribe fraction** in $[0, 1]$ of their current balance. The environment floors the paid amount to integer dollars.
+1. **Bribery:** Every alive player submits a **bribe fraction** in $[0, 1]$ of balance.
+   * **Fraction $= 0$:** pay **\$0** (no private channel this round).
+   * **Fraction $> 0$** and balance $\geq$ `min_bribe_dollars` (default **\$1**): pay at least **\$1**, capped by balance (integer dollars).
 2. The Host observation is updated with all bribe amounts (players do not yet see signals).
 
 ### Phase II: Signaling (`Phase.SIGNAL`)
 
 1. The Host observes all bribes and the true winning door.
-2. The Host broadcasts a **Public Signal** (a door index $0 \ldots D-1$, potentially false).
-3. The Host sends a **Private Signal** (per player, same index range). Reliability is a learned Host strategy (often correlated with bribe rank).
+2. The Host broadcasts a **Public Signal** to everyone (door index $0 \ldots D-1$, potentially false).
+3. **Private signals are only delivered to players with `bribe > 0`.** Non-bribers keep private index **$-1$** (no insider hint). Host may still *choose* per-player private actions in training, but the environment only stores them for bribers.
 
 Players still do **not** see raw door numbers in their observation—only abstract signal features described in §3.
 
@@ -48,7 +50,7 @@ Players still do **not** see raw door numbers in their observation—only abstra
    | Value | `PlayerBelief` | Mapped door |
    | ---: | --- | --- |
    | `0` | `BELIEVE_PUBLIC` | Door indicated by the public signal |
-   | `1` | `BELIEVE_PRIVATE` | Door indicated by this player's private signal |
+   | `1` | `BELIEVE_PRIVATE` | Door from this player's private signal (**only if `bribe > 0`**; otherwise coerced to `RANDOM`) |
    | `2` | `RANDOM` | Uniform random door in $\{0,\ldots,D-1\}$ |
 
    * **Bet fraction** in $[0, 1]$ of remaining balance (floored to integer dollars; minimum \$1 for alive players who can afford it).

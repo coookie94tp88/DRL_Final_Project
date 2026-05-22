@@ -23,7 +23,7 @@ class Phase(IntEnum):
 class PlayerBelief(IntEnum):
     """Player bet-phase action: env maps to a concrete door internally."""
     BELIEVE_PUBLIC = 0   # follow public signal door
-    BELIEVE_PRIVATE = 1  # follow private signal door
+    BELIEVE_PRIVATE = 1  # follow private signal door (only if bribe > 0 this round)
     RANDOM = 2           # uniform random door (ignore signals)
 
 
@@ -54,6 +54,7 @@ class OracleGambitConfig:
     min_bet_fraction: float = 0.0
     max_bet_fraction: float = 1.0
     min_bet_dollars: float = 1.0
+    min_bribe_dollars: float = 1.0   # if fraction > 0 and balance allows, pay at least this
     min_bribe_fraction: float = 0.0
     max_bribe_fraction: float = 1.0
 
@@ -123,12 +124,12 @@ class OracleGambitEnv(gym.Env):
                Returns host observation (host now sees all bribe amounts).
 
         2. step_signal(public_signal, private_signals)
-               Host broadcasts one public signal and one private signal per player.
-               Returns player observations (players now have signal context).
+               Host broadcasts a public signal to all. Private indices are stored only for
+               players with bribe > 0; others remain -1 (no insider channel).
 
         3. step_bet(player_beliefs, player_bet_fractions)
                Players choose BELIEVE_PUBLIC / BELIEVE_PRIVATE / RANDOM plus bet fraction.
-               The environment maps beliefs to concrete doors (players never see door indices).
+               BELIEVE_PRIVATE without bribe is coerced to RANDOM. Doors are mapped internally.
                Effective bribe/bet amounts are integer dollars via np.floor.
                Settlement is computed; rewards and new observations are returned.
 
@@ -326,7 +327,9 @@ class OracleGambitEnv(gym.Env):
 
         Args:
             player_bribe_fractions: shape (num_players,), each value is a fraction in [0, 1]
-                of that player's current balance; paid bribe is floored to integer dollars.
+                of that player's current balance. Paid bribe is floored to integer dollars.
+                If fraction > 0 and balance >= min_bribe_dollars, the player pays at least
+                min_bribe_dollars (capped by balance). Fraction == 0 means no bribe ($0).
 
         Returns (obs, {}, False, False, info).
         The returned obs carries updated *host* context (host now sees the bribes).
@@ -347,11 +350,17 @@ class OracleGambitEnv(gym.Env):
             player_bribe_fractions, c.min_bribe_fraction, c.max_bribe_fraction
         )
         raw_bribes = np.where(active, self.balances * clamped_fractions, 0.0)
-        clamped = np.floor(raw_bribes).astype(np.float32)
+        bribes = np.floor(raw_bribes).astype(np.float32)
+        wants_bribe = active & (clamped_fractions > 0)
+        can_afford_min = active & (self.balances >= c.min_bribe_dollars)
+        apply_min = wants_bribe & can_afford_min
+        bribes = np.where(apply_min, np.maximum(bribes, c.min_bribe_dollars), bribes)
+        bribes = np.where(wants_bribe & ~can_afford_min, 0.0, bribes)
+        bribes = np.minimum(bribes, self.balances)
 
-        self.balances -= clamped
-        self.current_bribes = clamped
-        self.current_total_bribes = float(np.sum(clamped))
+        self.balances -= bribes
+        self.current_bribes = bribes
+        self.current_total_bribes = float(np.sum(bribes))
 
         self.phase = Phase.SIGNAL
         return self._get_observations(), {}, False, False, self._get_info()
@@ -365,7 +374,8 @@ class OracleGambitEnv(gym.Env):
 
         Args:
             public_signal: single door index (0 … num_doors-1) broadcast to all.
-            private_signals: shape (num_players,), per-player door hints.
+            private_signals: shape (num_players,), per-player door hints from the Host.
+                Only players with bribe > 0 receive a stored private index; others get -1.
 
         Returns (obs, {}, False, False, info).
         The returned obs carries updated *player* context (players now see signals).
@@ -382,7 +392,12 @@ class OracleGambitEnv(gym.Env):
             )
 
         self.current_public_signal = int(np.clip(public_signal, 0, c.num_doors - 1))
-        self.current_private_signals = np.clip(private_signals, 0, c.num_doors - 1)
+        bribed = self.current_bribes > 0
+        self.current_private_signals = np.full(c.num_players, -1, dtype=np.int32)
+        if np.any(bribed):
+            self.current_private_signals[bribed] = np.clip(
+                private_signals[bribed], 0, c.num_doors - 1
+            )
 
         self.phase = Phase.BET
         return self._get_observations(), {}, False, False, self._get_info()
@@ -392,16 +407,25 @@ class OracleGambitEnv(gym.Env):
         beliefs: np.ndarray,
         public_signal: int,
         private_signals: np.ndarray,
+        bribes: np.ndarray,
         num_doors: int,
         rng: np.random.Generator,
     ) -> np.ndarray:
         """Map BELIEVE_PUBLIC / BELIEVE_PRIVATE / RANDOM to concrete door indices."""
         beliefs = np.clip(beliefs.astype(np.int32), 0, 2)
+        no_private = bribes <= 0
+        beliefs = np.where(
+            no_private & (beliefs == PlayerBelief.BELIEVE_PRIVATE),
+            PlayerBelief.RANDOM,
+            beliefs,
+        )
         random_doors = rng.integers(0, num_doors, size=beliefs.shape[0], dtype=np.int32)
+        has_private = private_signals >= 0
+        private_doors = np.where(has_private, private_signals, random_doors)
         return np.where(
             beliefs == PlayerBelief.BELIEVE_PUBLIC,
             public_signal,
-            np.where(beliefs == PlayerBelief.BELIEVE_PRIVATE, private_signals, random_doors),
+            np.where(beliefs == PlayerBelief.BELIEVE_PRIVATE, private_doors, random_doors),
         )
 
     def step_bet(
@@ -413,7 +437,7 @@ class OracleGambitEnv(gym.Env):
 
         Args:
             player_beliefs: shape (num_players,), each in {0, 1, 2}:
-                0=BELIEVE_PUBLIC, 1=BELIEVE_PRIVATE, 2=RANDOM.
+                0=BELIEVE_PUBLIC, 1=BELIEVE_PRIVATE (requires bribe > 0), 2=RANDOM.
             player_bet_fractions: shape (num_players,), fraction of balance to bet [0, 1].
                 Effective bet is floored to integer dollars, with a minimum bet of $1
                 for alive players who can afford at least $1.
@@ -442,6 +466,7 @@ class OracleGambitEnv(gym.Env):
             player_beliefs,
             self.current_public_signal,
             self.current_private_signals,
+            self.current_bribes,
             c.num_doors,
             self.rng,
         )
@@ -504,7 +529,8 @@ class OracleGambitEnv(gym.Env):
         bribe_private_hit = np.full(c.num_players, -1.0, dtype=np.float32)
         bribed = self.current_bribes > 0
         bribe_private_hit[bribed] = (
-            self.current_private_signals[bribed] == winning_door
+            (self.current_private_signals[bribed] >= 0)
+            & (self.current_private_signals[bribed] == winning_door)
         ).astype(np.float32)
 
         self._push_history(

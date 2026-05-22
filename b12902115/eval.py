@@ -106,7 +106,7 @@ if __name__ == "__main__":
     config = OracleGambitConfig(
         num_players=10, 
         num_doors=4, 
-        max_rounds=20, # Eval 時可以先看 20 局 
+        max_rounds=10, # Eval 時可以先看 20 局 
         initial_balance=1000.0,
     )
     env = OracleGambitEnv(config=config, seed=42)

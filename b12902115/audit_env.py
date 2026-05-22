@@ -49,6 +49,9 @@ def run_audit(episodes: int = 200, seed: int = 42) -> bool:
                 pub = int(rng.integers(0, c.num_doors))
                 priv = rng.integers(0, c.num_doors, size=c.num_players)
                 env.step_signal(pub, priv)
+                for i in range(c.num_players):
+                    if env.current_bribes[i] <= 0 and env.current_private_signals[i] >= 0:
+                        failures.append(f"ep{ep} p{i}: private stored without bribe")
                 obs = env._get_observations()
                 for i in range(c.num_players):
                     if obs["players"]["current"][i, 0] <= 0:
@@ -75,8 +78,15 @@ def run_audit(episodes: int = 200, seed: int = 42) -> bool:
                 m_priv = beliefs == PlayerBelief.BELIEVE_PRIVATE
                 if np.any(m_pub) and not np.all(chosen[m_pub] == pre_pub):
                     failures.append(f"ep{ep} BELIEVE_PUBLIC mapping failed")
-                if np.any(m_priv) and not np.all(chosen[m_priv] == pre_priv[m_priv]):
+                bribed = env.hist_bribes[-1] > 0
+                priv_bet = m_priv & bribed
+                if np.any(priv_bet) and not np.all(chosen[priv_bet] == pre_priv[priv_bet]):
                     failures.append(f"ep{ep} BELIEVE_PRIVATE mapping failed")
+                no_bribe_priv = m_priv & ~bribed
+                if np.any(no_bribe_priv):
+                    for i in np.where(no_bribe_priv)[0]:
+                        if pre_priv[i] >= 0:
+                            failures.append(f"ep{ep} p{i}: private signal without bribe")
 
                 bets = env.hist_bets[-1]
                 n_bet = int(np.sum(bets > 0))

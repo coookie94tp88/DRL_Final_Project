@@ -64,6 +64,8 @@ class BetActor(nn.Module):
 
 
 class TrainedPlayerAgent:
+    BELIEF_NAMES = BetActor.BELIEF_NAMES
+
     def __init__(self, model_path: str, device: str = "cpu"):
         self.device = torch.device(device)
         self.actor_bribe = BribeActor().to(self.device)

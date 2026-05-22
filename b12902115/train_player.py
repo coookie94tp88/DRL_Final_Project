@@ -192,10 +192,12 @@ def host_policy(bribes, winning_door, num_players, num_doors):
     top_3_indices = np.argsort(bribes)[-3:]
     
     for i in range(num_players):
-        if i in top_3_indices and bribes[i] > 0: # 有付錢且是前三名才給真話
+        if bribes[i] <= 0:
+            private_signals[i] = 0  # env ignores unless bribe > 0
+        elif i in top_3_indices:
             private_signals[i] = winning_door
         else:
-            private_signals[i] = random.randint(0, num_doors - 1) # 隨機亂說
+            private_signals[i] = random.randint(0, num_doors - 1)
             
     return public_signal, private_signals
 
@@ -232,7 +234,7 @@ def train():
     
     gamma1, gamma2 = 0.3, 0.99
     tau = 0.005
-    alpha = 0.10
+    alpha = 0.01  # low entropy reg so shaping/Q dominate (was 0.10)
     grad_clip_norm = 1.0
     batch_size = 256
     eps = 1e-6
@@ -271,8 +273,8 @@ def train():
         pub_sig, priv_sigs = host_policy(
             env.current_bribes, winning_door, config.num_players, config.num_doors
         )
-        last_private_signals = np.array(priv_sigs, dtype=np.int32)
         env.step_signal(pub_sig, priv_sigs)
+        last_private_signals = env.current_private_signals.copy()
         
         # 獲取包含訊號的狀態 s2
         obs2 = env._get_observations()

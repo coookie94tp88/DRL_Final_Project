@@ -21,9 +21,13 @@ This document complements [README.md](README.md). The **environment** uses belie
 
 ```bash
 python train_both.py --num-doors 4 --seed 42 --total-bet-steps 120000 --save-every-episodes 50
+# SAC entropy coeff (default 0.01; use 0 to disable entropy regularization in the loss):
+python train_both.py --sac-alpha 0.01
 ```
 
-Episode logs include **PubTruth** / **PrivTruth**: fraction of rounds where the host’s public (or per-player private) signal matched the winning door.
+Episode logs include **PubTruth** / **PrivTruth**: public honesty vs. private honesty **among bribers only** (`PrivTruth`).
+
+**Rules:** bribe fraction $> 0$ ⇒ pay at least \$1 (if affordable); private signals only for `bribe > 0`; `BELIEVE_PRIVATE` without bribe maps to random.
 
 ## Payout threshold
 
