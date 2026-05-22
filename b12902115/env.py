@@ -97,9 +97,10 @@ class OracleGambitConfig:
     @property
     def host_player_state_dim(self) -> int:
         """Per-player state dimension visible to the host.
-        Fields: [normalized_balance, active_flag, bribe_this_round]
+        Fields: [normalized_balance, active_flag, bribe_this_round, private_honest_now]
+        private_honest_now: 1=private matched winner, 0=lied, -1=no bribe / N/A.
         """
-        return 3
+        return 4
 
     @property
     def hist_host_dim(self) -> int:
@@ -236,6 +237,13 @@ class OracleGambitEnv(gym.Env):
                 shape=(c.history_window, c.hist_host_dim),
                 dtype=np.float32,
             ),
+            # per-player private honesty over past rounds (same encoding as hist_bribe_private_hit)
+            "private_honesty_hist": spaces.Box(
+                low=-1.0,
+                high=1.0,
+                shape=(c.num_players, c.history_window),
+                dtype=np.float32,
+            ),
         })
 
         # gym.Env required attributes (combined for framework compatibility)
@@ -299,6 +307,7 @@ class OracleGambitEnv(gym.Env):
             (c.history_window,), -1.0, dtype=np.float32)
         self.hist_host_public_honest: np.ndarray = np.full(
             (c.history_window,), -1.0, dtype=np.float32)
+        # Per player per round: 1=private honest, 0=private lied, -1=no bribe
         self.hist_bribe_private_hit: np.ndarray = np.full(
             (c.history_window, c.num_players), -1.0, dtype=np.float32)
 
@@ -667,6 +676,20 @@ class OracleGambitEnv(gym.Env):
         history = np.stack(player_hist_list, axis=0)
         return {"current": current, "history": history}
 
+    def _private_honest_current(self) -> np.ndarray:
+        """Per-player private honesty this round (Host only). -1 if no bribe."""
+        c = self.cfg
+        out = np.full(c.num_players, -1.0, dtype=np.float32)
+        if self.current_winning_door < 0:
+            return out
+        bribed = self.current_bribes > 0
+        valid = bribed & (self.current_private_signals >= 0)
+        if np.any(valid):
+            out[valid] = (
+                self.current_private_signals[valid] == self.current_winning_door
+            ).astype(np.float32)
+        return out
+
     def _get_host_obs(self) -> dict[str, np.ndarray]:
         """Build host observation.
 
@@ -675,12 +698,13 @@ class OracleGambitEnv(gym.Env):
                       Fields: [cumulative_profit, total_bribes_this_round,
                                winning_door_onehot × num_doors]
             players : (num_players, host_player_state_dim)
-                      Fields per player: [normalized_balance, active_flag, bribe_this_round]
+                      Fields per player: [balance, active, bribe, private_honest_now]
                       Zeros for eliminated players.
             history : (history_window, hist_host_dim)
-                      Fields per step: [host_profit, public_signal, frac_correct,
-                                        frac_believe_public, frac_believe_private, frac_random,
-                                        host_public_honest, private_signal_distribution × D]
+            private_honesty_hist : (num_players, history_window)
+                      Past private honesty per player: 1=honest, 0=lied, -1=no bribe.
+            history fields per step: host_profit, public_signal, frac_*, host_public_honest,
+                      private_signal_distribution × num_doors.
         """
         c = self.cfg
 
@@ -699,7 +723,10 @@ class OracleGambitEnv(gym.Env):
             balances = balances / max(c.initial_balance, c.epsilon)
         balances = np.where(active_mask_bool, balances, 0.0)
         visible_bribes = np.where(active_mask_bool, self.current_bribes, 0.0)
-        players = np.stack([balances, active_mask, visible_bribes], axis=1)
+        private_honest_now = np.where(active_mask_bool, self._private_honest_current(), -1.0)
+        players = np.stack(
+            [balances, active_mask, visible_bribes, private_honest_now], axis=1
+        )
 
         priv_dist = np.zeros((c.history_window, c.num_doors), dtype=np.float32)
         for t in range(c.history_window):
@@ -720,10 +747,13 @@ class OracleGambitEnv(gym.Env):
             priv_dist,
         ], axis=1).astype(np.float32)
 
+        private_honesty_hist = self.hist_bribe_private_hit.T.astype(np.float32)  # (N, W)
+
         return {
             "current": current,
             "players": players.astype(np.float32),
             "history": history,
+            "private_honesty_hist": private_honesty_hist,
         }
 
     def _get_observations(self) -> dict[str, dict]:
@@ -750,6 +780,7 @@ class OracleGambitEnv(gym.Env):
             "host_current_shape": (c.current_host_dim,),
             "host_players_shape": (c.num_players, c.host_player_state_dim),
             "host_history_shape": (c.history_window, c.hist_host_dim),
+            "host_private_honesty_hist_shape": (c.num_players, c.history_window),
         }
 
     # ─────────────────────────────────────────────

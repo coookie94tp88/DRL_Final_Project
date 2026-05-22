@@ -240,56 +240,101 @@ class TwoStepReplayBuffer:
 
 
 class HostRDQN(nn.Module):
-    def __init__(self, num_players=10, num_doors=4, hist_dim=11, d_model=128):
+    def __init__(
+        self,
+        num_players=10,
+        num_doors=4,
+        hist_dim=11,
+        history_window=SEQ_LEN,
+        d_model=128,
+    ):
         super().__init__()
         self.num_players = num_players
         self.num_doors = num_doors
         self.lstm = nn.LSTM(input_size=hist_dim, hidden_size=d_model, batch_first=True)
-        self.fc_curr = nn.Linear(num_doors + num_players, d_model)
+        self.priv_hist_proj = nn.Linear(history_window, 32)
+        curr_in = num_doors + num_players + num_players + num_players * 32
+        self.fc_curr = nn.Linear(curr_in, d_model)
         self.fc_fusion = nn.Sequential(nn.Linear(d_model * 2, 256), nn.ReLU())
         self.q_pub = nn.Linear(256, num_doors)
         self.q_privs = nn.ModuleList([nn.Linear(256, num_doors) for _ in range(num_players)])
 
-    def forward(self, curr, hist):
+    def forward(self, curr, hist, priv_hist):
+        """
+        priv_hist: (batch, num_players, history_window) — 1=honest, 0=lied, -1=no bribe.
+        """
         _, (h_n, _) = self.lstm(hist)
         hist_feat = h_n[-1]
-        curr_feat = F.relu(self.fc_curr(curr))
+        priv_feat = F.relu(self.priv_hist_proj(priv_hist))
+        priv_flat = priv_feat.reshape(priv_feat.size(0), -1)
+        curr_feat = F.relu(self.fc_curr(torch.cat([curr, priv_flat], dim=-1)))
         merged = self.fc_fusion(torch.cat([hist_feat, curr_feat], dim=-1))
         return self.q_pub(merged), [head(merged) for head in self.q_privs]
 
 
 def process_host_obs(env, device="cpu"):
     c = env.cfg
+    host_obs = env._get_observations()["host"]
     winning_door = env.current_winning_door
     bribes = env.current_bribes
     win_door_oh = np.zeros(c.num_doors, dtype=np.float32)
     if winning_door >= 0:
         win_door_oh[winning_door] = 1.0
+    honest_now = host_obs["players"][:, 3].astype(np.float32)
     curr_tensor = torch.as_tensor(
-        np.concatenate([win_door_oh, bribes]), dtype=torch.float32, device=device
+        np.concatenate([win_door_oh, bribes, honest_now]),
+        dtype=torch.float32,
+        device=device,
     ).unsqueeze(0)
-    hist = env._get_observations()["host"]["history"]
-    hist_tensor = torch.as_tensor(hist, dtype=torch.float32, device=device).unsqueeze(0)
-    return curr_tensor, hist_tensor
+    hist_tensor = torch.as_tensor(host_obs["history"], dtype=torch.float32, device=device).unsqueeze(0)
+    priv_hist_tensor = torch.as_tensor(
+        host_obs["private_honesty_hist"], dtype=torch.float32, device=device
+    ).unsqueeze(0)
+    return curr_tensor, hist_tensor, priv_hist_tensor
 
 
 class HostReplayBuffer:
     def __init__(self, capacity=50000):
         self.buffer = deque(maxlen=capacity)
 
-    def push(self, curr_state, hist_state, action, reward, next_curr, next_hist, done):
-        self.buffer.append((curr_state, hist_state, action, reward, next_curr, next_hist, done))
+    def push(
+        self,
+        curr_state,
+        hist_state,
+        priv_hist_state,
+        action,
+        reward,
+        next_curr,
+        next_hist,
+        next_priv_hist,
+        done,
+    ):
+        self.buffer.append(
+            (
+                curr_state,
+                hist_state,
+                priv_hist_state,
+                action,
+                reward,
+                next_curr,
+                next_hist,
+                next_priv_hist,
+                done,
+            )
+        )
 
     def sample(self, batch_size, device):
         batch = random.sample(self.buffer, batch_size)
-        curr, hist, act, rew, n_curr, n_hist, dn = zip(*batch)
+        curr, hist, priv_hist, act, rew, n_curr, n_hist, n_priv_hist, dn = zip(*batch)
         return (
             torch.cat(curr, dim=0).to(device),
             torch.cat(hist, dim=0).to(device),
+            torch.cat(priv_hist, dim=0).to(device),
             act,
             torch.as_tensor(rew, dtype=torch.float32, device=device).unsqueeze(1),
             torch.cat(n_curr, dim=0).to(device),
             torch.cat(n_hist, dim=0).to(device),
+            torch.cat(n_priv_hist, dim=0).to(device),
             torch.as_tensor(dn, dtype=torch.float32, device=device).unsqueeze(1),
         )
 
@@ -468,6 +513,7 @@ def train_both(
         num_players=config.num_players,
         num_doors=config.num_doors,
         hist_dim=host_hist_dim,
+        history_window=config.history_window,
     ).to(device)
     host_target_rdqn = copy.deepcopy(host_rdqn)
     h_opt = optim.Adam(host_rdqn.parameters(), lr=1e-3)
@@ -479,7 +525,7 @@ def train_both(
     out_dir = os.path.join(script_dir, "checkpoints")
     os.makedirs(out_dir, exist_ok=True)
 
-    prev_host_curr = prev_host_hist = prev_host_action = None
+    prev_host_curr = prev_host_hist = prev_host_priv_hist = prev_host_action = None
     last_host_reward = 0.0
     last_private_signals = np.zeros(config.num_players, dtype=np.int32)
     prev_round_trust_profit_mask = np.zeros(config.num_players, dtype=np.float32)
@@ -541,15 +587,17 @@ def train_both(
             r1_np = clamp_rewards_np(-current_bribes_np + trust_bribe_rebate)
 
         elif env.phase == Phase.SIGNAL:
-            curr_tensor, hist_tensor = process_host_obs(env, device=device)
+            curr_tensor, hist_tensor, priv_hist_tensor = process_host_obs(env, device=device)
             if prev_host_curr is not None:
                 host_buffer.push(
                     prev_host_curr,
                     prev_host_hist,
+                    prev_host_priv_hist,
                     prev_host_action,
                     last_host_reward,
                     curr_tensor,
                     hist_tensor,
+                    priv_hist_tensor,
                     done=0,
                 )
 
@@ -558,7 +606,7 @@ def train_both(
                 priv_acts = [random.randint(0, config.num_doors - 1) for _ in range(config.num_players)]
             else:
                 with torch.no_grad():
-                    q_pub, q_privs = host_rdqn(curr_tensor, hist_tensor)
+                    q_pub, q_privs = host_rdqn(curr_tensor, hist_tensor, priv_hist_tensor)
                     pub_act = q_pub.argmax(dim=-1).item()
                     priv_acts = [q.argmax(dim=-1).item() for q in q_privs]
 
@@ -568,6 +616,7 @@ def train_both(
             }
             prev_host_curr = curr_tensor
             prev_host_hist = hist_tensor
+            prev_host_priv_hist = priv_hist_tensor
             prev_host_action = host_action
 
             winning_door = env.current_winning_door
@@ -717,16 +766,24 @@ def train_both(
                     tp.data.copy_(p_tau * p.data + (1 - p_tau) * tp.data)
 
             if len(host_buffer) >= batch_size:
-                b_curr, b_hist, b_acts, b_rew, b_ncurr, b_nhist, b_done = host_buffer.sample(
-                    batch_size, device
-                )
+                (
+                    b_curr,
+                    b_hist,
+                    b_priv_hist,
+                    b_acts,
+                    b_rew,
+                    b_ncurr,
+                    b_nhist,
+                    b_npriv_hist,
+                    b_done,
+                ) = host_buffer.sample(batch_size, device)
                 b_act_pub = torch.tensor(
                     [a["public_signal"] for a in b_acts], dtype=torch.long, device=device
                 ).view(-1, 1)
                 priv_matrix = np.stack([a["private_signals"] for a in b_acts], axis=0)
                 b_act_privs = torch.as_tensor(priv_matrix, dtype=torch.long, device=device)
 
-                q_pub, q_privs = host_rdqn(b_curr, b_hist)
+                q_pub, q_privs = host_rdqn(b_curr, b_hist, b_priv_hist)
                 q_pub_val = q_pub.gather(1, b_act_pub)
                 q_priv_vals = sum(
                     q_privs[i].gather(1, b_act_privs[:, i].view(-1, 1))
@@ -735,7 +792,7 @@ def train_both(
                 total_q = q_pub_val + q_priv_vals
 
                 with torch.no_grad():
-                    next_q_pub, next_q_privs = host_target_rdqn(b_ncurr, b_nhist)
+                    next_q_pub, next_q_privs = host_target_rdqn(b_ncurr, b_nhist, b_npriv_hist)
                     max_next_q = next_q_pub.max(1)[0].unsqueeze(1)
                     max_next_q += sum(q.max(1)[0].unsqueeze(1) for q in next_q_privs)
                     target_q = b_rew + h_gamma * max_next_q * (1 - b_done)
@@ -751,17 +808,19 @@ def train_both(
 
             if terminated or truncated:
                 if prev_host_curr is not None:
-                    curr_tensor, hist_tensor = process_host_obs(env, device=device)
+                    curr_tensor, hist_tensor, priv_hist_tensor = process_host_obs(env, device=device)
                     host_buffer.push(
                         prev_host_curr,
                         prev_host_hist,
+                        prev_host_priv_hist,
                         prev_host_action,
                         last_host_reward,
                         curr_tensor,
                         hist_tensor,
+                        priv_hist_tensor,
                         done=1,
                     )
-                prev_host_curr = prev_host_hist = prev_host_action = None
+                prev_host_curr = prev_host_hist = prev_host_priv_hist = prev_host_action = None
                 h_epsilon = max(h_eps_min, h_epsilon * h_eps_decay)
                 episodes += 1
 

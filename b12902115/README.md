@@ -133,8 +133,9 @@ The Host has **full observability** of ground truth and per-player bribes.
 
 ```text
 host["current"]  : (2 + num_doors,)   # cumulative profit, total bribes, winning door one-hot
-host["players"]  : (num_players, 3)   # balance, active, bribe this round
+host["players"]  : (num_players, 4)   # balance, active, bribe, private_honest_now (-1/0/1)
 host["history"]  : (history_window, 7 + num_doors)
+host["private_honesty_hist"] : (num_players, history_window)  # past private: 1 honest, 0 lied, -1 no bribe
 ```
 
 #### Host history (per round)
@@ -147,6 +148,8 @@ host["history"]  : (history_window, 7 + num_doors)
 | `frac_believe_public` / `frac_believe_private` / `frac_random` | Belief-mode shares among bettors. |
 | `host_public_honest` | Whether public signal matched the winner. |
 | `private_signal_distribution` | Histogram of private signals sent (`num_doors` bins). |
+
+**`private_honesty_hist` (Host only):** For each player $i$ and past round $t$: `1` if they bribed and private matched the winner, `0` if bribed and lied, `-1` if no bribe. Same data as players' `bribe_private_hit` history, exposed to the Host for per-player targeting.
 
 #### Host action space (`Phase.SIGNAL`)
 
