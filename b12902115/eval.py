@@ -5,7 +5,7 @@ from rich.text import Text
 from rich.panel import Panel
 
 # 載入你的環境與雙方 Agent
-from env import OracleGambitEnv, OracleGambitConfig, Phase
+from env import OracleGambitEnv, OracleGambitConfig, Phase, PlayerBelief
 from player_agent import TrainedPlayerAgent
 from host_agent import TrainedHostAgent
 
@@ -21,9 +21,12 @@ def render_round_log(console: Console, env: OracleGambitEnv, rewards: dict, info
     correct_door = info["winning_door"]
     pub_sig = int(env.hist_public_signal[-1])
     priv_sigs = env.hist_private_signals[-1].astype(int)
-    beliefs = env.hist_beliefs[-1].astype(int)
-    choices = env.hist_chosen_doors[-1].astype(int)
+    raw_beliefs = env.hist_beliefs[-1].astype(int)
     bribes = env.hist_bribes[-1]
+    # BELIEVE_PRIVATE without bribe is coerced to RANDOM in env._map_beliefs_to_doors
+    beliefs = raw_beliefs.copy()
+    beliefs[(bribes <= 0) & (beliefs == PlayerBelief.BELIEVE_PRIVATE)] = PlayerBelief.RANDOM
+    choices = env.hist_chosen_doors[-1].astype(int)
     bets = env.hist_bets[-1]
     player_rewards = env.hist_player_rewards[-1]
     host_profit = rewards["host"]
@@ -97,6 +100,110 @@ def render_round_log(console: Console, env: OracleGambitEnv, rewards: dict, info
     console.print(table)
 
 
+class EvalPlayerStats:
+    """Per-player aggregates over all completed rounds in one episode."""
+
+    def __init__(self, num_players: int) -> None:
+        self.n = num_players
+        self.alive_rounds = np.zeros(num_players, dtype=np.int32)
+        self.bribe_frac_sum = np.zeros(num_players, dtype=np.float64)
+        self.bribe_paid_rounds = np.zeros(num_players, dtype=np.int32)
+        self.believe_public = np.zeros(num_players, dtype=np.int32)
+        self.believe_private = np.zeros(num_players, dtype=np.int32)
+        self.believe_random = np.zeros(num_players, dtype=np.int32)
+        self.priv_truth_rounds = np.zeros(num_players, dtype=np.int32)
+
+    def record_round(
+        self,
+        *,
+        round_active: np.ndarray,
+        bribe_fractions: np.ndarray,
+        paid_bribes: np.ndarray,
+        beliefs: np.ndarray,
+        private_signals: np.ndarray,
+        winning_door: int,
+    ) -> None:
+        """Aggregate per-player stats for one completed betting round."""
+        effective = np.asarray(beliefs, dtype=np.int32).copy()
+        effective[(paid_bribes <= 0) & (effective == int(PlayerBelief.BELIEVE_PRIVATE))] = int(
+            PlayerBelief.RANDOM
+        )
+        for i in range(self.n):
+            if paid_bribes[i] > 0:
+                self.bribe_paid_rounds[i] += 1
+                if int(private_signals[i]) == int(winning_door):
+                    self.priv_truth_rounds[i] += 1
+            if round_active[i]:
+                self.alive_rounds[i] += 1
+                self.bribe_frac_sum[i] += float(bribe_fractions[i])
+                belief = int(effective[i])
+                if belief == int(PlayerBelief.BELIEVE_PUBLIC):
+                    self.believe_public[i] += 1
+                elif belief == int(PlayerBelief.BELIEVE_PRIVATE):
+                    self.believe_private[i] += 1
+                elif belief == int(PlayerBelief.RANDOM):
+                    self.believe_random[i] += 1
+
+
+def render_player_summary(console: Console, stats: EvalPlayerStats, total_rounds: int) -> None:
+    console.print(f"\n[bold yellow]=== Per-Player Summary ({total_rounds} rounds) ===[/bold yellow]")
+
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("Player", justify="right")
+    table.add_column("Alive Rds", justify="right")
+    table.add_column("Avg Bribe Frac", justify="right")
+    table.add_column("Bribe>0 (cnt)", justify="right")
+    table.add_column("pub", justify="right")
+    table.add_column("priv", justify="right")
+    table.add_column("rnd", justify="right")
+    table.add_column("P(Priv Truth)", justify="right")
+
+    for i in range(stats.n):
+        alive = int(stats.alive_rounds[i])
+        bribe_cnt = int(stats.bribe_paid_rounds[i])
+        bribe_cnt_str = f"{bribe_cnt}/{total_rounds}"
+        believe_pub = int(stats.believe_public[i])
+        believe_priv = int(stats.believe_private[i])
+        believe_rnd = int(stats.believe_random[i])
+        if alive > 0:
+            believe_pub_str = f"{believe_pub}/{alive}"
+            believe_priv_str = f"{believe_priv}/{alive}"
+            believe_rnd_str = f"{believe_rnd}/{alive}"
+        else:
+            believe_pub_str = believe_priv_str = believe_rnd_str = "N/A"
+
+        if alive > 0:
+            avg_frac = stats.bribe_frac_sum[i] / alive
+            avg_frac_str = f"{avg_frac * 100:.2f}%"
+        else:
+            avg_frac_str = "-"
+
+        if bribe_cnt > 0:
+            p_priv = stats.priv_truth_rounds[i] / bribe_cnt
+            priv_str = f"{int(stats.priv_truth_rounds[i])}/{bribe_cnt} ({p_priv * 100:.1f}%)"
+        else:
+            priv_str = "N/A"
+
+        table.add_row(
+            f"P{i}",
+            str(alive),
+            avg_frac_str,
+            bribe_cnt_str,
+            believe_pub_str,
+            believe_priv_str,
+            believe_rnd_str,
+            priv_str,
+        )
+
+    console.print(table)
+    console.print(
+        "[grey62]Bribe>0 (cnt): paid bribe > 0 rounds / episode rounds. "
+        "pub/priv/rnd: effective belief counts / alive rounds. "
+        "P(Priv Truth): private honest rounds / bribe>0 rounds. "
+        "Avg Bribe Frac: mean actor output while alive (before env min-$1).[/grey62]"
+    )
+
+
 if __name__ == "__main__":
     console = Console()
     
@@ -106,7 +213,7 @@ if __name__ == "__main__":
     config = OracleGambitConfig(
         num_players=10, 
         num_doors=4, 
-        max_rounds=10, # Eval 時可以先看 20 局 
+        max_rounds=20, # Eval 時可以先看 20 局 
         initial_balance=1000.0,
     )
     env = OracleGambitEnv(config=config, seed=42)
@@ -127,11 +234,15 @@ if __name__ == "__main__":
     ))
     
     round_count = 1
-    
+    player_stats = EvalPlayerStats(config.num_players)
+    last_bribe_fractions = np.zeros(config.num_players, dtype=np.float32)
+
     while True:
         if env.phase == Phase.BRIBE:
+            round_active = env.balances > 0
             # 1. 玩家推論：決定賄賂比例 (deterministic=True)
             bribe_fractions = player_agent.get_bribe_action(obs["players"], deterministic=True)
+            last_bribe_fractions = np.asarray(bribe_fractions, dtype=np.float32).copy()
             action = {"player_bribe_fractions": bribe_fractions}
             obs, _, _, _, info = env.step(action)
             
@@ -155,9 +266,19 @@ if __name__ == "__main__":
             
             # 4. 渲染結果
             render_round_log(console, env, rewards, info, round_count)
-            
+
+            player_stats.record_round(
+                round_active=round_active,
+                bribe_fractions=last_bribe_fractions,
+                paid_bribes=env.hist_bribes[-1],
+                beliefs=env.hist_beliefs[-1],
+                private_signals=env.hist_private_signals[-1],
+                winning_door=int(info["winning_door"]),
+            )
+
             if terminated or truncated:
                 console.print(f"\n[bold yellow]Game Over at Round {round_count}![/bold yellow]")
+                render_player_summary(console, player_stats, round_count)
                 break
-                
+
             round_count += 1

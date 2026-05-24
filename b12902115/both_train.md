@@ -17,7 +17,26 @@ This document complements [README.md](README.md). The **environment** uses belie
 - **Shaped reward:** env host profit + `2.0 × bribes` + truth bonuses − lie penalty (bribe-weighted).
 - Checkpoints: `checkpoints/host.pth` with `num_doors` metadata.
 
-## CLI
+## SB3 baseline (`train_sb3.py`)
+
+Alternative co-training with **Stable-Baselines3 PPO** (same belief env as `env.py`):
+
+- **Player:** `MultiInputPolicy` + `PlayerExtractor` (flatten `current` + `history`)
+- **Action (flat Box, 3×N):** sub-step A uses `[:N]` bribe only; sub-step B uses `[N:2N]` bet + `[2N:3N]` belief (after SIGNAL — same as `eval_sb3`)
+- **Belief encoding:** continuous dims in $[0,2]$ → `rint` → `0=pub, 1=priv, 2=rnd` (see `train_sb3.py` docstring)
+- **Timesteps:** `--total-rounds R` → `2×R` PPO env steps (two steps per game round)
+- **Host:** MLP policy gradient on env `host_profit` (includes `private_honesty_hist`)
+- **Checkpoints:** `checkpoints_sb3/player_model_<round>.zip`, `host_model_<round>.pt`
+- **Loader:** `sb3_player_agent.SB3PlayerAgent` for eval scripts
+
+```bash
+conda activate doorl
+export MPLCONFIGDIR=/tmp2/b12902115/tmp/mpl
+python train_sb3.py --total-rounds 2000 --save-every 200 --num-doors 4 --max-rounds 15
+python train_sb3.py --resume-player checkpoints_sb3/player_model_800.zip --resume-host checkpoints_sb3/host_model_800.pt
+```
+
+## CLI (SAC + RDQN)
 
 ```bash
 python train_both.py --num-doors 4 --seed 42 --total-bet-steps 120000 --save-every-episodes 50
