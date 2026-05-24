@@ -81,7 +81,7 @@ class PlayerEnvWrapper(gym.Env):
             "avg_bribe": 0.0,
             "host_final_reward": 0.0,
             "player_final_reward": 0.0,
-            "host_true_private_signal_rate": 1.0,
+            "host_true_private_signal_rate": 0.0,
             "player_follow_private_signal_rate": 0.0,
         }
 

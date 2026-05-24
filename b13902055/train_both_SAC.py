@@ -469,8 +469,6 @@ def train_both(
 
             obs, _, _, _, _ = env.step({"player_bribe_fractions": bribe_action_np})
             current_bribes_np = env.current_bribes.copy()
-            ep_bribe_avg_sum += float(np.mean(current_bribes_np))
-            ep_bribe_steps += 1
             last_raw_bribes_np = current_bribes_np.copy()
             # Apply last-round trust/profit success to this round's bribe penalty:
             # if previous round proved profitable when private info was truthful,
@@ -541,6 +539,8 @@ def train_both(
 
             bet_steps += 1
             round_in_ep += 1
+            ep_bribe_avg_sum += float(np.mean(env.hist_bribes[-1]))
+            ep_bribe_steps += 1
             ep_bet_avg_sum += float(np.mean(env.hist_bets[-1]))
             ep_bet_steps += 1
 
