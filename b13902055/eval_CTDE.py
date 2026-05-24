@@ -20,7 +20,13 @@ def get_door_name(door_idx: int) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint_path", required=True, help="Path to CTDE checkpoint (.pt)")
+    parser.add_argument(
+        "--checkpoint-path",
+        "--checkpoint_path",
+        dest="checkpoint_path",
+        required=True,
+        help="Path to CTDE checkpoint (.pt)",
+    )
     parser.add_argument("--episodes", type=int, default=5)
     parser.add_argument("--num_players", type=int, default=10)
     parser.add_argument("--num_doors", type=int, default=4)
