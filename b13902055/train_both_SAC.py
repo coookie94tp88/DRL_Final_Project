@@ -430,8 +430,8 @@ def train_both(
 
     ep_player_reward_sum = 0.0
     ep_host_reward_sum = 0.0
-    ep_bribe_amount_sum = 0.0
-    ep_bet_amount_sum = 0.0
+    ep_bribe_avg_sum = 0.0
+    ep_bet_avg_sum = 0.0
     ep_bribe_steps = 0
     ep_bet_steps = 0
     ep_door_counts = np.zeros(config.num_doors, dtype=np.float64)
@@ -469,7 +469,7 @@ def train_both(
 
             obs, _, _, _, _ = env.step({"player_bribe_fractions": bribe_action_np})
             current_bribes_np = env.current_bribes.copy()
-            ep_bribe_amount_sum += float(np.mean(current_bribes_np))
+            ep_bribe_avg_sum += float(np.mean(current_bribes_np))
             ep_bribe_steps += 1
             last_raw_bribes_np = current_bribes_np.copy()
             # Apply last-round trust/profit success to this round's bribe penalty:
@@ -541,7 +541,7 @@ def train_both(
 
             bet_steps += 1
             round_in_ep += 1
-            ep_bet_amount_sum += float(np.mean(env.hist_bets[-1]))
+            ep_bet_avg_sum += float(np.mean(env.hist_bets[-1]))
             ep_bet_steps += 1
 
             host_bribe_income = float(np.sum(last_raw_bribes_np))
@@ -717,8 +717,8 @@ def train_both(
 
                 total_doors = np.sum(ep_door_counts) + epsilon_stability
                 door_pct = (ep_door_counts / total_doors) * 100.0
-                avg_bribe = ep_bribe_amount_sum / max(1, ep_bribe_steps)
-                avg_bet = ep_bet_amount_sum / max(1, ep_bet_steps)
+                avg_bribe = ep_bribe_avg_sum / max(1, ep_bribe_steps)
+                avg_bet = ep_bet_avg_sum / max(1, ep_bet_steps)
                 avg_priv_truth = ep_priv_truth_rate_sum / max(1, ep_signal_steps)
                 avg_priv_follow = ep_priv_follow_rate_sum / max(1, ep_signal_steps)
                 avg_trust_profit = ep_trust_profit_rate_sum / max(1, ep_signal_steps)
@@ -768,8 +768,8 @@ def train_both(
                 round_in_ep = 0
                 ep_player_reward_sum = 0.0
                 ep_host_reward_sum = 0.0
-                ep_bribe_amount_sum = 0.0
-                ep_bet_amount_sum = 0.0
+                ep_bribe_avg_sum = 0.0
+                ep_bet_avg_sum = 0.0
                 ep_bribe_steps = 0
                 ep_bet_steps = 0
                 ep_signal_steps = 0
