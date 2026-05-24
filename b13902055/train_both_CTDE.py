@@ -37,6 +37,10 @@ def flatten_global_obs(obs: dict[str, dict[str, np.ndarray]]) -> np.ndarray:
 
 
 class PlayerActor(nn.Module):
+    LOG_STD_MIN = -5.0
+    LOG_STD_MAX = 1.0
+    EPSILON = 1e-6
+
     def __init__(self, local_obs_dim: int, num_doors: int):
         super().__init__()
         self.num_doors = num_doors
@@ -47,9 +51,11 @@ class PlayerActor(nn.Module):
             nn.ReLU(),
         )
         self.bribe_mu = nn.Linear(128, 1)
-        self.bribe_log_std = nn.Parameter(torch.tensor(-1.0))
+        # One shared log-std per action head (broadcast across players/batch).
+        self.bribe_log_std = nn.Parameter(torch.tensor(0.0))
         self.bet_mu = nn.Linear(128, 1)
-        self.bet_log_std = nn.Parameter(torch.tensor(-1.0))
+        # One shared log-std per action head (broadcast across players/batch).
+        self.bet_log_std = nn.Parameter(torch.tensor(0.0))
         self.door_logits = nn.Linear(128, num_doors)
 
     def _sample_fraction(self, mu: torch.Tensor, log_std: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -57,13 +63,13 @@ class PlayerActor(nn.Module):
         dist = Normal(mu, std)
         raw = dist.rsample()
         frac = torch.sigmoid(raw)
-        log_prob = dist.log_prob(raw) - torch.log(frac * (1.0 - frac) + 1e-6)
-        return frac, log_prob.squeeze(-1)
+        log_prob = dist.log_prob(raw) - torch.log(frac * (1.0 - frac) + self.EPSILON)
+        return frac, log_prob.sum(dim=-1)
 
     def sample_bribe(self, local_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         feat = self.shared(local_obs)
         mu = self.bribe_mu(feat)
-        log_std = self.bribe_log_std.expand_as(mu).clamp(-5.0, 1.0)
+        log_std = self.bribe_log_std.expand_as(mu).clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
         return self._sample_fraction(mu, log_std)
 
     def sample_bet(self, local_obs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -73,7 +79,7 @@ class PlayerActor(nn.Module):
         door_log_prob = door_dist.log_prob(door)
 
         mu = self.bet_mu(feat)
-        log_std = self.bet_log_std.expand_as(mu).clamp(-5.0, 1.0)
+        log_std = self.bet_log_std.expand_as(mu).clamp(self.LOG_STD_MIN, self.LOG_STD_MAX)
         bet_frac, bet_log_prob = self._sample_fraction(mu, log_std)
         return door, bet_frac, door_log_prob + bet_log_prob
 
@@ -108,6 +114,10 @@ class HostPolicy(nn.Module):
         self.private_head = nn.Linear(128, num_players * num_doors)
 
     def sample_action(self, host_obs: torch.Tensor) -> tuple[int, np.ndarray, torch.Tensor]:
+        """Return (public_signal, private_signals_np, log_prob).
+
+        private_signals are returned as numpy because env.step_signal expects numpy/int arrays.
+        """
         feat = self.net(host_obs)
         public_logits = self.public_head(feat)
         private_logits = self.private_head(feat).view(self.num_players, self.num_doors)
@@ -140,6 +150,7 @@ class TrainConfig:
     lr_player: float = 3e-4
     lr_critic: float = 3e-4
     lr_host: float = 3e-4
+    grad_clip_norm: float = 1.0
     num_players: int = 10
     num_doors: int = 4
     max_rounds: int = 20
@@ -174,7 +185,7 @@ def train_both_ctde(cfg: TrainConfig) -> None:
     env = OracleGambitEnv(config=env_cfg, seed=cfg.seed)
     obs, _ = env.reset()
 
-    local_obs_dim = int(np.prod(obs["players"]["current"].shape[1:]) + np.prod(obs["players"]["history"].shape[1:]))
+    local_obs_dim = flatten_local_player_obs(obs["players"], 0).shape[0]
     global_obs_dim = flatten_global_obs(obs).shape[0]
     host_obs_dim = flatten_host_obs(obs["host"]).shape[0]
 
@@ -194,16 +205,17 @@ def train_both_ctde(cfg: TrainConfig) -> None:
         host_log_probs: list[torch.Tensor] = []
         host_rewards: list[float] = []
 
-        terminated = False
-        truncated = False
-        while not (terminated or truncated):
+        while True:
             if env.phase != Phase.BRIBE:
-                raise RuntimeError("Expected BRIBE phase at loop start.")
+                raise RuntimeError(
+                    f"Expected BRIBE phase at loop start, but got {env.phase}. "
+                    "This usually means a prior phase step did not complete correctly."
+                )
 
             global_state = torch.as_tensor(flatten_global_obs(obs), dtype=torch.float32, device=device)
             player_values.append(player_critic(global_state))
 
-            bribe_log_prob_sum = torch.tensor(0.0, dtype=torch.float32, device=device)
+            bribe_log_prob_sum = torch.zeros((), dtype=torch.float32, device=device)
             bribe_fracs = np.zeros(cfg.num_players, dtype=np.float32)
             for i in range(cfg.num_players):
                 local_obs_np = flatten_local_player_obs(obs["players"], i)
@@ -215,16 +227,22 @@ def train_both_ctde(cfg: TrainConfig) -> None:
             obs, _, _, _, _ = env.step({"player_bribe_fractions": bribe_fracs})
 
             if env.phase != Phase.SIGNAL:
-                raise RuntimeError("Expected SIGNAL phase after bribe.")
+                raise RuntimeError(
+                    f"Expected SIGNAL phase after bribe, but got {env.phase}. "
+                    "Check BRIBE actions and environment transitions."
+                )
             host_obs_tensor = torch.as_tensor(flatten_host_obs(obs["host"]), dtype=torch.float32, device=device)
             pub, priv, host_logp = host_policy.sample_action(host_obs_tensor)
             host_log_probs.append(host_logp)
             obs, _, _, _, _ = env.step({"public_signal": pub, "private_signals": priv})
 
             if env.phase != Phase.BET:
-                raise RuntimeError("Expected BET phase after signal.")
+                raise RuntimeError(
+                    f"Expected BET phase after signal, but got {env.phase}. "
+                    "Check host SIGNAL actions and environment transitions."
+                )
 
-            bet_log_prob_sum = torch.tensor(0.0, dtype=torch.float32, device=device)
+            bet_log_prob_sum = torch.zeros((), dtype=torch.float32, device=device)
             doors = np.zeros(cfg.num_players, dtype=np.int32)
             bet_fracs = np.zeros(cfg.num_players, dtype=np.float32)
             for i in range(cfg.num_players):
@@ -241,34 +259,41 @@ def train_both_ctde(cfg: TrainConfig) -> None:
 
             round_player_reward = float(np.mean(rewards["players"]))
             player_rewards.append(round_player_reward)
+            # Shared player actor update (collective objective): sum log-prob across all players in a round.
             player_log_probs.append(bribe_log_prob_sum + bet_log_prob_sum)
 
             round_host_reward = float(rewards["host"])
             host_rewards.append(round_host_reward)
+            if terminated or truncated:
+                break
 
         returns_player = discounted_returns(player_rewards, cfg.gamma, device)
         values = torch.stack(player_values)
+        # Detach baseline values so actor update does not backprop through critic.
         advantages = returns_player - values.detach()
 
         critic_loss = F.mse_loss(values, returns_player)
-        player_loss = -(advantages * torch.stack(player_log_probs)).mean()
+        # CTDE choice here is team-level: centralized critic provides one advantage per round.
+        player_log_probs_tensor = torch.stack(player_log_probs)
+        assert player_log_probs_tensor.shape == advantages.shape
+        player_loss = -(advantages * player_log_probs_tensor).mean()
 
         returns_host = discounted_returns(host_rewards, cfg.gamma, device)
         host_loss = -(returns_host * torch.stack(host_log_probs)).mean()
 
         opt_critic.zero_grad()
         critic_loss.backward()
-        nn.utils.clip_grad_norm_(player_critic.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(player_critic.parameters(), cfg.grad_clip_norm)
         opt_critic.step()
 
         opt_player.zero_grad()
         player_loss.backward()
-        nn.utils.clip_grad_norm_(player_actor.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(player_actor.parameters(), cfg.grad_clip_norm)
         opt_player.step()
 
         opt_host.zero_grad()
         host_loss.backward()
-        nn.utils.clip_grad_norm_(host_policy.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(host_policy.parameters(), cfg.grad_clip_norm)
         opt_host.step()
 
         if ep % 10 == 0 or ep == 1:
@@ -319,6 +344,7 @@ if __name__ == "__main__":
     parser.add_argument("--lr-player", type=float, default=3e-4)
     parser.add_argument("--lr-critic", type=float, default=3e-4)
     parser.add_argument("--lr-host", type=float, default=3e-4)
+    parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--out-dir", type=str, default="./checkpoints_ctde")
     args = parser.parse_args()
@@ -330,6 +356,7 @@ if __name__ == "__main__":
         lr_player=args.lr_player,
         lr_critic=args.lr_critic,
         lr_host=args.lr_host,
+        grad_clip_norm=args.grad_clip_norm,
         num_players=args.num_players,
         num_doors=args.num_doors,
         max_rounds=args.max_rounds,
