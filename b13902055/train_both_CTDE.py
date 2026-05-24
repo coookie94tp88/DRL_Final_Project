@@ -240,6 +240,7 @@ def train_both_ctde(cfg: TrainConfig) -> None:
         ep_truth_rate_sum = 0.0
         ep_follow_rate_sum = 0.0
         ep_rounds = 0
+        ep_truth_rate_rounds = 0
 
         while True:
             if env.phase != Phase.BRIBE:
@@ -304,6 +305,7 @@ def train_both_ctde(cfg: TrainConfig) -> None:
             private_signals = env.hist_private_signals[-1].astype(np.int32)
             if winning_door >= 0:
                 ep_truth_rate_sum += float(np.mean(private_signals == winning_door))
+                ep_truth_rate_rounds += 1
             ep_follow_rate_sum += float(np.mean(doors == private_signals))
             ep_avg_bet_sum += float(np.mean(env.hist_bets[-1]))
             ep_avg_bribe_sum += float(np.mean(env.hist_bribes[-1]))
@@ -353,7 +355,7 @@ def train_both_ctde(cfg: TrainConfig) -> None:
             "avg_bribe": ep_avg_bribe_sum / max(1, ep_rounds),
             "host_final_reward": float(np.sum(host_rewards)),
             "player_final_reward": float(np.sum(player_rewards)),
-            "host_true_private_signal_rate": ep_truth_rate_sum / max(1, ep_rounds),
+            "host_true_private_signal_rate": ep_truth_rate_sum / max(1, ep_truth_rate_rounds),
             "player_follow_private_signal_rate": ep_follow_rate_sum / max(1, ep_rounds),
         }
         metrics_rows.append(metric_row)

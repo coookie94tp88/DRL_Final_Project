@@ -115,13 +115,18 @@ class PlayerEnvWrapper(gym.Env):
         if self.base.phase != Phase.BET:
             raise RuntimeError("Expected Phase.BET after signal.")
         obs, rewards, terminated, truncated, info = self.base.step_bet(doors, bet_frac)
+        winning_door = int(info.get("winning_door", -1))
+        if winning_door >= 0:
+            host_truth_rate = float(np.mean(private_signals == winning_door))
+        else:
+            host_truth_rate = 0.0
         follow_private_rate = float(np.mean(doors == private_signals))
         self.last_round_metrics = {
             "avg_bet": float(np.mean(self.base.hist_bets[-1])),
             "avg_bribe": float(np.mean(self.base.hist_bribes[-1])),
             "host_final_reward": float(self.base.hist_host_profit[-1]),
             "player_final_reward": float(np.mean(self.base.hist_player_rewards[-1])),
-            "host_true_private_signal_rate": 1.0,
+            "host_true_private_signal_rate": host_truth_rate,
             "player_follow_private_signal_rate": follow_private_rate,
         }
         reward_scalar = float(np.mean(rewards["players"]))
