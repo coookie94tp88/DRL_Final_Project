@@ -4,6 +4,8 @@ import os
 import numpy as np
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 from env import OracleGambitConfig, OracleGambitEnv, Phase
 from host_CTDE_agent import TrainedCTDEHostAgent
@@ -16,6 +18,87 @@ def get_door_name(door_idx: int) -> str:
     if door_idx < 0:
         return "-"
     return chr(65 + int(door_idx))
+
+
+def render_round_log(
+    console: Console,
+    env: OracleGambitEnv,
+    rewards: dict,
+    info: dict,
+    episode_num: int,
+    round_num: int,
+) -> None:
+    c = env.cfg
+
+    correct_door = int(info["winning_door"])
+    pub_sig = int(env.hist_public_signal[-1])
+    priv_sigs = env.hist_private_signals[-1].astype(int)
+    choices = env.hist_choices[-1].astype(int)
+    bribes = env.hist_bribes[-1]
+    bets = env.hist_bets[-1]
+    player_rewards = env.hist_player_rewards[-1]
+    host_profit = float(rewards["host"])
+
+    total_pool = float(np.sum(bets))
+    door_totals = np.zeros(c.num_doors, dtype=np.float32)
+    for i in range(c.num_players):
+        if bets[i] > 0:
+            door_totals[choices[i]] += bets[i]
+
+    door_ratios = np.zeros(c.num_doors, dtype=np.float32)
+    if total_pool > 0:
+        door_ratios = door_totals / total_pool
+
+    console.print(f"\n[bold cyan]=== Episode {episode_num} / Round {round_num} ===[/bold cyan]")
+
+    summary_text = Text()
+    summary_text.append(f"Winning Door: {get_door_name(correct_door)}\n", style="bold green")
+    summary_text.append(f"Host Public Signal: {get_door_name(pub_sig)}\n", style="bold yellow")
+    summary_text.append(f"Total Pool: {total_pool:.2f}\n", style="bold magenta")
+    summary_text.append(f"Host Profit: {host_profit:.2f}\n", style="bold red" if host_profit < 0 else "bold green")
+    door_ratio_str = " | ".join([f"{get_door_name(d)}: {door_ratios[d] * 100:.1f}%" for d in range(c.num_doors)])
+    summary_text.append(f"Door Distribution: [{door_ratio_str}]", style="bold blue")
+    console.print(Panel(summary_text, title="Round Summary", expand=False))
+
+    table = Table(show_header=True, header_style="bold magenta")
+    table.add_column("Player", justify="right")
+    table.add_column("Bal (Start)", justify="right")
+    table.add_column("Bribe", justify="right")
+    table.add_column("Priv Sig", justify="center")
+    table.add_column("Bet", justify="right")
+    table.add_column("Choice", justify="center")
+    table.add_column("Reward", justify="right")
+    table.add_column("Bal (End)", justify="right", style="bold cyan")
+
+    for i in range(c.num_players):
+        bal_start = float(env.balances[i] - player_rewards[i])
+        bal_end = float(env.balances[i])
+        b_val = float(bribes[i])
+        bet_val = float(bets[i])
+        p_sig = get_door_name(priv_sigs[i])
+        choice_str = get_door_name(choices[i])
+        r_val = float(player_rewards[i])
+
+        if choices[i] == correct_door and bet_val > 0:
+            choice_str = f"[green]{choice_str} ✓[/green]"
+        elif bet_val > 0:
+            choice_str = f"[red]{choice_str} ✗[/red]"
+
+        if priv_sigs[i] == correct_door:
+            p_sig = f"[green]{p_sig}[/green]"
+
+        table.add_row(
+            f"P{i}",
+            f"{bal_start:.1f}",
+            f"{b_val:.1f}",
+            p_sig,
+            f"{bet_val:.1f}",
+            choice_str,
+            f"[green]+{r_val:.1f}[/green]" if r_val > 0 else f"[red]{r_val:.1f}[/red]",
+            f"{bal_end:.1f}",
+        )
+
+    console.print(table)
 
 
 def main() -> None:
@@ -65,6 +148,14 @@ def main() -> None:
         device=args.device,
     )
 
+    console.print(
+        Panel(
+            "OracleGambit - CTDE Evaluation\n"
+            f"Players={cfg.num_players}  Doors={cfg.num_doors}  Rounds={cfg.max_rounds}  Episodes={args.episodes}",
+            style="bold yellow",
+        )
+    )
+
     episode_player_rewards = []
     episode_host_rewards = []
     total_rounds = 0
@@ -74,6 +165,7 @@ def main() -> None:
         ep_player_reward = 0.0
         ep_host_reward = 0.0
         rounds = 0
+        console.print(f"\n[bold yellow]Starting Episode {ep}/{args.episodes}[/bold yellow]")
 
         while True:
             if env.phase == Phase.BRIBE:
@@ -90,13 +182,20 @@ def main() -> None:
                 ep_player_reward += float(np.mean(rewards["players"]))
                 ep_host_reward += float(rewards["host"])
                 rounds += 1
+                render_round_log(
+                    console=console,
+                    env=env,
+                    rewards=rewards,
+                    info=info,
+                    episode_num=ep,
+                    round_num=rounds,
+                )
 
                 if terminated or truncated:
                     console.print(
-                        f"[cyan]Ep {ep}[/cyan] rounds={rounds} "
-                        f"player_return={ep_player_reward:+.2f} "
-                        f"host_return={ep_host_reward:+.2f} "
-                        f"last_winning_door={get_door_name(info['winning_door'])}"
+                        f"\n[bold yellow]Episode {ep} Over at Round {rounds}![/bold yellow]\n"
+                        f"[cyan]Episode return[/cyan] "
+                        f"player={ep_player_reward:+.2f} host={ep_host_reward:+.2f}"
                     )
                     break
             else:
