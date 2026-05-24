@@ -1,6 +1,7 @@
 import argparse
 import os
 import random
+import csv
 from dataclasses import dataclass
 
 import numpy as np
@@ -11,6 +12,34 @@ import torch.optim as optim
 from torch.distributions import Categorical, Normal
 
 from env import OracleGambitConfig, OracleGambitEnv, Phase
+
+
+METRIC_COLUMNS = [
+    "step",
+    "avg_bet",
+    "avg_bribe",
+    "host_final_reward",
+    "player_final_reward",
+    "host_true_private_signal_rate",
+    "player_follow_private_signal_rate",
+]
+
+
+def _save_metrics_csv(path, rows):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=METRIC_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _print_metric_row(prefix, row):
+    print(
+        f"{prefix} | step={int(row['step'])} | avg_bet={row['avg_bet']:.3f} | "
+        f"avg_bribe={row['avg_bribe']:.3f} | host_final_reward={row['host_final_reward']:+.3f} | "
+        f"player_final_reward={row['player_final_reward']:+.3f} | "
+        f"host_true_private_signal_rate={row['host_true_private_signal_rate']:.3f} | "
+        f"player_follow_private_signal_rate={row['player_follow_private_signal_rate']:.3f}"
+    )
 
 
 def set_seed(seed: int) -> None:
@@ -196,6 +225,8 @@ def train_both_ctde(cfg: TrainConfig) -> None:
     opt_player = optim.Adam(player_actor.parameters(), lr=cfg.lr_player)
     opt_critic = optim.Adam(player_critic.parameters(), lr=cfg.lr_critic)
     opt_host = optim.Adam(host_policy.parameters(), lr=cfg.lr_host)
+    metrics_path = os.path.join(cfg.out_dir, "training_metrics.csv")
+    metrics_rows = []
 
     for ep in range(1, cfg.episodes + 1):
         obs, _ = env.reset()
@@ -204,6 +235,11 @@ def train_both_ctde(cfg: TrainConfig) -> None:
         player_rewards: list[float] = []
         host_log_probs: list[torch.Tensor] = []
         host_rewards: list[float] = []
+        ep_avg_bet_sum = 0.0
+        ep_avg_bribe_sum = 0.0
+        ep_truth_rate_sum = 0.0
+        ep_follow_rate_sum = 0.0
+        ep_rounds = 0
 
         while True:
             if env.phase != Phase.BRIBE:
@@ -253,7 +289,7 @@ def train_both_ctde(cfg: TrainConfig) -> None:
                 bet_fracs[i] = float(bet_frac.squeeze(0).item())
                 bet_log_prob_sum = bet_log_prob_sum + logp.squeeze(0)
 
-            obs, rewards, terminated, truncated, _ = env.step(
+            obs, rewards, terminated, truncated, info = env.step(
                 {"player_doors": doors, "bet_fractions": bet_fracs}
             )
 
@@ -264,6 +300,14 @@ def train_both_ctde(cfg: TrainConfig) -> None:
 
             round_host_reward = float(rewards["host"])
             host_rewards.append(round_host_reward)
+            winning_door = int(info.get("winning_door", -1))
+            private_signals = env.hist_private_signals[-1].astype(np.int32)
+            if winning_door >= 0:
+                ep_truth_rate_sum += float(np.mean(private_signals == winning_door))
+            ep_follow_rate_sum += float(np.mean(doors == private_signals))
+            ep_avg_bet_sum += float(np.mean(env.hist_bets[-1]))
+            ep_avg_bribe_sum += float(np.mean(env.hist_bribes[-1]))
+            ep_rounds += 1
             if terminated or truncated:
                 break
 
@@ -303,6 +347,19 @@ def train_both_ctde(cfg: TrainConfig) -> None:
                 f"host_return={returns_host[0].item():+.2f}"
             )
 
+        metric_row = {
+            "step": ep,
+            "avg_bet": ep_avg_bet_sum / max(1, ep_rounds),
+            "avg_bribe": ep_avg_bribe_sum / max(1, ep_rounds),
+            "host_final_reward": float(np.sum(host_rewards)),
+            "player_final_reward": float(np.sum(player_rewards)),
+            "host_true_private_signal_rate": ep_truth_rate_sum / max(1, ep_rounds),
+            "player_follow_private_signal_rate": ep_follow_rate_sum / max(1, ep_rounds),
+        }
+        metrics_rows.append(metric_row)
+        if ep % 10 == 0 or ep == 1:
+            _print_metric_row("[Metrics]", metric_row)
+
         if ep % cfg.save_every == 0:
             torch.save(
                 {
@@ -315,6 +372,7 @@ def train_both_ctde(cfg: TrainConfig) -> None:
                 },
                 os.path.join(cfg.out_dir, f"ctde_ep_{ep}.pt"),
             )
+            _save_metrics_csv(metrics_path, metrics_rows)
 
     final_path = os.path.join(cfg.out_dir, "ctde_final.pt")
     torch.save(
@@ -328,6 +386,10 @@ def train_both_ctde(cfg: TrainConfig) -> None:
         },
         final_path,
     )
+    _save_metrics_csv(metrics_path, metrics_rows)
+    if metrics_rows:
+        _print_metric_row("[Metrics]", metrics_rows[-1])
+    print(f"Metrics saved to {metrics_path}")
     print(f"Training complete. Saved: {final_path}")
 
 

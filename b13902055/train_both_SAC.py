@@ -2,6 +2,7 @@ import argparse
 import copy
 import os
 import random
+import csv
 from collections import deque
 
 import numpy as np
@@ -12,6 +13,34 @@ import torch.optim as optim
 from torch.distributions import Normal
 
 from env import OracleGambitConfig, OracleGambitEnv, Phase
+
+
+METRIC_COLUMNS = [
+    "step",
+    "avg_bet",
+    "avg_bribe",
+    "host_final_reward",
+    "player_final_reward",
+    "host_true_private_signal_rate",
+    "player_follow_private_signal_rate",
+]
+
+
+def _save_metrics_csv(path, rows):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=METRIC_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _print_metric_row(prefix, row):
+    print(
+        f"{prefix} | step={int(row['step'])} | avg_bet={row['avg_bet']:.3f} | "
+        f"avg_bribe={row['avg_bribe']:.3f} | host_final_reward={row['host_final_reward']:+.3f} | "
+        f"player_final_reward={row['player_final_reward']:+.3f} | "
+        f"host_true_private_signal_rate={row['host_true_private_signal_rate']:.3f} | "
+        f"player_follow_private_signal_rate={row['player_follow_private_signal_rate']:.3f}"
+    )
 
 
 def set_seed(seed: int) -> None:
@@ -401,8 +430,8 @@ def train_both(
 
     ep_player_reward_sum = 0.0
     ep_host_reward_sum = 0.0
-    ep_bribe_mean_sum = 0.0
-    ep_bet_mean_sum = 0.0
+    ep_bribe_amount_sum = 0.0
+    ep_bet_amount_sum = 0.0
     ep_bribe_steps = 0
     ep_bet_steps = 0
     ep_door_counts = np.zeros(config.num_doors, dtype=np.float64)
@@ -414,6 +443,8 @@ def train_both(
     script_dir = os.path.dirname(os.path.abspath(__file__))
     out_dir = os.path.join(script_dir, "checkpoints")
     os.makedirs(out_dir, exist_ok=True)
+    metrics_path = os.path.join(out_dir, "training_metrics.csv")
+    metrics_rows = []
 
     print("🔥 Start co-training (player SAC + host RDQN)")
     last_private_signals = np.zeros(config.num_players, dtype=np.int32)
@@ -436,11 +467,10 @@ def train_both(
                 bribe_frac, _ = player_actor1.sample(s1_tensor)
             bribe_action_np = bribe_frac.cpu().numpy().flatten()
 
-            ep_bribe_mean_sum += float(np.mean(bribe_action_np))
-            ep_bribe_steps += 1
-
             obs, _, _, _, _ = env.step({"player_bribe_fractions": bribe_action_np})
             current_bribes_np = env.current_bribes.copy()
+            ep_bribe_amount_sum += float(np.mean(current_bribes_np))
+            ep_bribe_steps += 1
             last_raw_bribes_np = current_bribes_np.copy()
             # Apply last-round trust/profit success to this round's bribe penalty:
             # if previous round proved profitable when private info was truthful,
@@ -499,9 +529,6 @@ def train_both(
 
             door_idx_np = door_idx.cpu().numpy()
             bet_frac_np = bet_frac.cpu().numpy().flatten()
-
-            ep_bet_mean_sum += float(np.mean(bet_frac_np))
-            ep_bet_steps += 1
             for d in door_idx_np:
                 ep_door_counts[int(d)] += 1
 
@@ -514,6 +541,8 @@ def train_both(
 
             bet_steps += 1
             round_in_ep += 1
+            ep_bet_amount_sum += float(np.mean(env.hist_bets[-1]))
+            ep_bet_steps += 1
 
             host_bribe_income = float(np.sum(last_raw_bribes_np))
             if "winning_door" not in info:
@@ -688,8 +717,8 @@ def train_both(
 
                 total_doors = np.sum(ep_door_counts) + epsilon_stability
                 door_pct = (ep_door_counts / total_doors) * 100.0
-                avg_bribe = ep_bribe_mean_sum / max(1, ep_bribe_steps)
-                avg_bet = ep_bet_mean_sum / max(1, ep_bet_steps)
+                avg_bribe = ep_bribe_amount_sum / max(1, ep_bribe_steps)
+                avg_bet = ep_bet_amount_sum / max(1, ep_bet_steps)
                 avg_priv_truth = ep_priv_truth_rate_sum / max(1, ep_signal_steps)
                 avg_priv_follow = ep_priv_follow_rate_sum / max(1, ep_signal_steps)
                 avg_trust_profit = ep_trust_profit_rate_sum / max(1, ep_signal_steps)
@@ -704,12 +733,25 @@ def train_both(
                     f"H_Eps: {h_epsilon:.3f}"
                 )
                 print(
-                    f"   📊 Avg BribeFrac: {avg_bribe:.3f} | Avg BetFrac: {avg_bet:.3f} | "
+                    f"   📊 Avg Bribe: {avg_bribe:.3f} | Avg Bet: {avg_bet:.3f} | "
                     f"PrivTruth: {avg_priv_truth:.3f} | PrivFollow: {avg_priv_follow:.3f} | "
                     f"TrustProfit: {avg_trust_profit:.3f}"
                 )
                 print(f"   🚪 Doors: {door_str}")
                 print("-" * 70)
+
+                metric_row = {
+                    "step": episodes,
+                    "avg_bet": avg_bet,
+                    "avg_bribe": avg_bribe,
+                    "host_final_reward": ep_host_reward_sum,
+                    "player_final_reward": ep_player_reward_sum,
+                    "host_true_private_signal_rate": avg_priv_truth,
+                    "player_follow_private_signal_rate": avg_priv_follow,
+                }
+                metrics_rows.append(metric_row)
+                _print_metric_row("[Metrics]", metric_row)
+                _save_metrics_csv(metrics_path, metrics_rows)
 
                 if episodes % save_every_episodes == 0:
                     player_path, host_path = save_separate_models(
@@ -726,8 +768,8 @@ def train_both(
                 round_in_ep = 0
                 ep_player_reward_sum = 0.0
                 ep_host_reward_sum = 0.0
-                ep_bribe_mean_sum = 0.0
-                ep_bet_mean_sum = 0.0
+                ep_bribe_amount_sum = 0.0
+                ep_bet_amount_sum = 0.0
                 ep_bribe_steps = 0
                 ep_bet_steps = 0
                 ep_signal_steps = 0
@@ -747,6 +789,10 @@ def train_both(
         episodes,
         out_dir,
     )
+    _save_metrics_csv(metrics_path, metrics_rows)
+    if metrics_rows:
+        _print_metric_row("[Metrics]", metrics_rows[-1])
+    print(f"Metrics saved to {metrics_path}")
     print(f"✅ Training done. Final models saved to:\n - {player_path}\n - {host_path}")
 
 

@@ -1,4 +1,5 @@
 import os
+import csv
 os.environ["MPLCONFIGDIR"] = "/tmp/mpl_cache"
 
 import numpy as np
@@ -10,6 +11,34 @@ from stable_baselines3 import PPO
 from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
 from env import OracleGambitEnv, OracleGambitConfig, Phase
+
+
+METRIC_COLUMNS = [
+    "step",
+    "avg_bet",
+    "avg_bribe",
+    "host_final_reward",
+    "player_final_reward",
+    "host_true_private_signal_rate",
+    "player_follow_private_signal_rate",
+]
+
+
+def _save_metrics_csv(path, rows):
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=METRIC_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def _print_metric_row(prefix, row):
+    print(
+        f"{prefix} | step={int(row['step'])} | avg_bet={row['avg_bet']:.3f} | "
+        f"avg_bribe={row['avg_bribe']:.3f} | host_final_reward={row['host_final_reward']:+.3f} | "
+        f"player_final_reward={row['player_final_reward']:+.3f} | "
+        f"host_true_private_signal_rate={row['host_true_private_signal_rate']:.3f} | "
+        f"player_follow_private_signal_rate={row['player_follow_private_signal_rate']:.3f}"
+    )
 
 
 # -----------------------------
@@ -115,6 +144,14 @@ class PlayerEnvWrapper(gym.Env):
         self.action_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
 
         self.last_host_logprob = None
+        self.last_round_metrics = {
+            "avg_bet": 0.0,
+            "avg_bribe": 0.0,
+            "host_final_reward": 0.0,
+            "player_final_reward": 0.0,
+            "host_true_private_signal_rate": 0.0,
+            "player_follow_private_signal_rate": 0.0,
+        }
 
     def reset(self, *, seed=None, options=None):
         obs, info = self.base.reset(seed=seed, options=options)
@@ -157,6 +194,21 @@ class PlayerEnvWrapper(gym.Env):
             doors, bet_frac
         )
 
+        winning_door = int(info.get("winning_door", -1))
+        if winning_door >= 0:
+            host_truth_rate = float(np.mean(private_signals == winning_door))
+        else:
+            host_truth_rate = 0.0
+        follow_private_rate = float(np.mean(doors == private_signals))
+        self.last_round_metrics = {
+            "avg_bet": float(np.mean(self.base.hist_bets[-1])),
+            "avg_bribe": float(np.mean(self.base.hist_bribes[-1])),
+            "host_final_reward": float(self.base.hist_host_profit[-1]),
+            "player_final_reward": float(np.mean(self.base.hist_player_rewards[-1])),
+            "host_true_private_signal_rate": host_truth_rate,
+            "player_follow_private_signal_rate": follow_private_rate,
+        }
+
         reward_scalar = float(np.mean(rewards["players"]))
         return obs["players"], reward_scalar, terminated, truncated, info
 
@@ -174,6 +226,8 @@ def train(
     import os
 
     os.makedirs(ckpt_dir, exist_ok=True)
+    metrics_path = os.path.join(ckpt_dir, "training_metrics.csv")
+    metrics_rows = []
     cfg = OracleGambitConfig(num_doors=3, num_players=10, max_rounds=20)
     base_env = OracleGambitEnv(cfg)
 
@@ -217,18 +271,27 @@ def train(
             host_optimizer.step()
 
             round_count += 1
+            row = {"step": round_count, **player_env.last_round_metrics}
+            metrics_rows.append(row)
 
         if round_count % save_every == 0 and round_count > 0:
             player_save_path = f"{ckpt_dir}/player_model_{round_count}.zip"
             host_save_path = f"{ckpt_dir}/host_model_{round_count}.pt"
             player_policy.save(player_save_path)
             torch.save(host_policy.state_dict(), host_save_path)
+            _save_metrics_csv(metrics_path, metrics_rows)
+            if metrics_rows:
+                _print_metric_row("[Metrics]", metrics_rows[-1])
             print(f"[Saved @ round {round_count}]")
 
     player_save_path = f"{ckpt_dir}/player_model_{round_count}.zip"
     host_save_path = f"{ckpt_dir}/host_model_{round_count}.pt"
     player_policy.save(player_save_path)
     torch.save(host_policy.state_dict(), host_save_path)
+    _save_metrics_csv(metrics_path, metrics_rows)
+    if metrics_rows:
+        _print_metric_row("[Metrics]", metrics_rows[-1])
+    print(f"Metrics saved to {metrics_path}")
     print(f"Training complete. Final checkpoint saved at round {round_count}")
 
 
