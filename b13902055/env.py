@@ -32,14 +32,14 @@ class OracleGambitConfig:
     num_players: int = 10
     num_doors: int = 4
     initial_balance: float = 1000.0
-    minority_threshold: float = 0.25    # host profits if winning_ratio < this
+    minority_threshold: float = 0.3    # host profits if winning_ratio < this
     max_rounds: int = 500
 
     # ── History buffer ──────────────────────────────────────
     history_window: int = 50            # number of past rounds kept in obs
 
     # ── Payout formula ──────────────────────────────────────
-    payout_threshold: float = 0.25              # break-even winning ratio
+    payout_threshold: float = 0.3             # break-even winning ratio
     min_winning_ratio_for_payout: float = 1e-3  # floor for division stability
     max_payout_multiplier: float | None = 100.0  # optional cap on multiplier
 

@@ -168,7 +168,7 @@ def train(
     total_rounds=10000,
     save_every=50,
     ckpt_dir="./checkpoints",
-    player_resume_path="./checkpoints/player_model_1450.zip",
+    player_resume_path="./checkpoints/player_model_800.zip",
     host_resume_path=None,
 ):
     import os
@@ -234,12 +234,12 @@ def train(
 
 if __name__ == "__main__":
     # Usage: optionally pass the checkpoint paths manually here
-    player_ckpt = input("Enter player model path to resume (or leave blank): ").strip() or None
-    host_ckpt = input("Enter host model path to resume (or leave blank): ").strip() or None
+    # player_ckpt = input("Enter player model path to resume (or leave blank): ").strip() or None
+    # host_ckpt = input("Enter host model path to resume (or leave blank): ").strip() or None
     train(
         total_rounds=10000,
         save_every=50,
         ckpt_dir="./checkpoints",
-        player_resume_path=player_ckpt,
-        host_resume_path=host_ckpt,
+        # player_resume_path=player_ckpt,
+        # host_resume_path=host_ckpt,
     )
