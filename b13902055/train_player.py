@@ -1,637 +1,133 @@
-import argparse
-import copy
 import os
-import random
-
+import argparse
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torch.optim as optim
-from torch.distributions import Normal
+import gymnasium as gym
+from stable_baselines3 import PPO
+from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
 
-from env import OracleGambitConfig, OracleGambitEnv, Phase
+from env import OracleGambitEnv, OracleGambitConfig, Phase
 
-
-def set_seed(seed: int) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
+os.environ["MPLCONFIGDIR"] = "/tmp/mpl_cache"
 
 
-def flatten_obs_player(obs_dict, device):
-    curr = torch.as_tensor(obs_dict["current"], dtype=torch.float32, device=device)
-    hist = torch.as_tensor(obs_dict["history"], dtype=torch.float32, device=device)
-    hist_flat = hist.view(hist.shape[0], -1)
-    return torch.cat([curr, hist_flat], dim=1)
-
-
-def encode_features(state_flat, num_doors=4, seq_len=50):
-    n = state_flat.shape[0]
-    curr = state_flat[:, :5]
-    hist = state_flat[:, 5:].view(n, seq_len, 7 + num_doors)
-
-    alive_bal_bribe = curr[:, 0:3]
-    pub_sig = curr[:, 3].long()
-    priv_sig = curr[:, 4].long()
-
-    pub_sig = torch.where(pub_sig < 0, num_doors, pub_sig)
-    priv_sig = torch.where(priv_sig < 0, num_doors, priv_sig)
-
-    pub_onehot = F.one_hot(pub_sig, num_classes=num_doors + 1).float()
-    priv_onehot = F.one_hot(priv_sig, num_classes=num_doors + 1).float()
-    curr_encoded = torch.cat([alive_bal_bribe, pub_onehot, priv_onehot], dim=1)
-
-    choice = hist[:, :, 0].long()
-    h_pub = hist[:, :, 1].long()
-    h_priv = hist[:, :, 2].long()
-    continuous_hist = hist[:, :, 3:]
-
-    choice = torch.where(choice < 0, num_doors, choice)
-    h_pub = torch.where(h_pub < 0, num_doors, h_pub)
-    h_priv = torch.where(h_priv < 0, num_doors, h_priv)
-
-    choice_oh = F.one_hot(choice, num_classes=num_doors + 1).float()
-    h_pub_oh = F.one_hot(h_pub, num_classes=num_doors + 1).float()
-    h_priv_oh = F.one_hot(h_priv, num_classes=num_doors + 1).float()
-
-    hist_encoded = torch.cat([choice_oh, h_pub_oh, h_priv_oh, continuous_hist], dim=2)
-    return curr_encoded, hist_encoded
-
-
-class TransformerExtractor(nn.Module):
-    def __init__(self, curr_dim, hist_dim, d_model=128, nhead=4, num_layers=2, seq_len=50):
-        super().__init__()
-        self.hist_proj = nn.Linear(hist_dim, d_model)
-        self.pos_emb = nn.Parameter(torch.randn(1, seq_len, d_model))
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            batch_first=True,
-            dim_feedforward=256,
+class PlayerExtractor(BaseFeaturesExtractor):
+    def __init__(self, observation_space):
+        curr_shape = observation_space["current"].shape
+        hist_shape = observation_space["history"].shape
+        super().__init__(observation_space, features_dim=128)
+        curr_dim = int(np.prod(curr_shape))
+        hist_dim = int(np.prod(hist_shape))
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(curr_dim + hist_dim, 256),
+            torch.nn.ReLU(),
+            torch.nn.Linear(256, 128),
+            torch.nn.ReLU(),
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.curr_proj = nn.Linear(curr_dim, d_model)
-        self.fc_out = nn.Sequential(nn.Linear(d_model * 2, 256), nn.ReLU())
-
-    def forward(self, curr_enc, hist_enc):
-        x = self.hist_proj(hist_enc) + self.pos_emb
-        x = self.transformer(x)
-        hist_summary = x[:, -1, :]
-        curr_summary = torch.relu(self.curr_proj(curr_enc))
-        return self.fc_out(torch.cat([hist_summary, curr_summary], dim=-1))
+    def forward(self, obs):
+        current = obs["current"].flatten(1)
+        history = obs["history"].flatten(1)
+        x = torch.cat([current, history], dim=1)
+        return self.net(x)
 
 
-class BribeActor(nn.Module):
-    def __init__(self, num_doors=4, log_std_min=-5.0, log_std_max=1.0):
+class PlayerEnvWrapper(gym.Env):
+    def __init__(self, base_env):
         super().__init__()
-        self.num_doors = num_doors
-        self.log_std_min = log_std_min
-        self.log_std_max = log_std_max
-        curr_dim = 2 * num_doors + 5
-        hist_dim = 4 * num_doors + 7
-        self.extractor = TransformerExtractor(curr_dim=curr_dim, hist_dim=hist_dim)
-        self.mu_layer = nn.Linear(256, 1)
-        self.log_std_layer = nn.Linear(256, 1)
+        self.base = base_env
+        self.cfg = base_env.cfg
+        self.num_players = self.cfg.num_players
+        self.num_doors = self.cfg.num_doors
+        self.observation_space = base_env.player_observation_space
 
-    def forward(self, state_flat):
-        curr_enc, hist_enc = encode_features(state_flat, num_doors=self.num_doors)
-        feat = self.extractor(curr_enc, hist_enc)
-        mu = self.mu_layer(feat)
-        log_std = torch.clamp(self.log_std_layer(feat), self.log_std_min, self.log_std_max)
-        return mu, log_std
-
-    def sample(self, state_flat):
-        mu, log_std = self.forward(state_flat)
-        std = log_std.exp()
-        dist = Normal(mu, std)
-        x_t = dist.rsample()
-        action = torch.sigmoid(x_t)
-        log_prob = dist.log_prob(x_t) - torch.log(action * (1 - action) + 1e-6)
-        return action, log_prob.sum(dim=-1, keepdim=True)
-
-
-class BetActor(nn.Module):
-    def __init__(self, num_doors=4, gumbel_tau=0.8, log_std_min=-5.0, log_std_max=1.0):
-        super().__init__()
-        self.num_doors = num_doors
-        self.gumbel_tau = gumbel_tau
-        self.log_std_min = log_std_min
-        self.log_std_max = log_std_max
-        curr_dim = 2 * num_doors + 5
-        hist_dim = 4 * num_doors + 7
-        self.extractor = TransformerExtractor(curr_dim=curr_dim, hist_dim=hist_dim)
-        self.door_logits_layer = nn.Linear(256, num_doors)
-        self.bet_mu_layer = nn.Linear(256, 1)
-        self.bet_log_std_layer = nn.Linear(256, 1)
-
-    def sample(self, state_flat):
-        curr_enc, hist_enc = encode_features(state_flat, num_doors=self.num_doors)
-        feat = self.extractor(curr_enc, hist_enc)
-
-        door_logits = self.door_logits_layer(feat)
-        door_one_hot = F.gumbel_softmax(door_logits, tau=self.gumbel_tau, hard=True)
-        door_probs = F.softmax(door_logits, dim=-1)
-        log_prob_door = torch.sum(
-            torch.log(door_probs + 1e-8) * door_one_hot, dim=-1, keepdim=True
+        # Action space: [bribe_fractions (N), bet_fractions (N), door_values (N)]
+        low = np.array([0.0] * (3 * self.num_players), dtype=np.float32)
+        high = np.array(
+            [1.0] * (2 * self.num_players) + [self.num_doors - 1] * self.num_players,
+            dtype=np.float32,
         )
-        door_idx = door_one_hot.argmax(dim=-1)
+        self.action_space = gym.spaces.Box(low=low, high=high, dtype=np.float32)
 
-        bet_mu = self.bet_mu_layer(feat)
-        bet_log_std = torch.clamp(self.bet_log_std_layer(feat), self.log_std_min, self.log_std_max)
-        bet_dist = Normal(bet_mu, bet_log_std.exp())
-        x_t = bet_dist.rsample()
-        bet_fraction = torch.sigmoid(x_t)
-        log_prob_bet = bet_dist.log_prob(x_t) - torch.log(bet_fraction * (1 - bet_fraction) + 1e-6)
+    def reset(self, *, seed=None, options=None):
+        obs, info = self.base.reset(seed=seed, options=options)
+        return obs["players"], info
 
-        total_log_prob = log_prob_door + log_prob_bet.sum(dim=-1, keepdim=True)
-        return door_idx, door_one_hot, bet_fraction, total_log_prob
+    def step(self, action):
+        if self.base.phase != Phase.BRIBE:
+            raise RuntimeError("Expected Phase.BRIBE at start of step().")
+        action = np.asarray(action, dtype=np.float32)
+        n = self.num_players
+
+        bribe = np.clip(action[:n], 0.0, 1.0)
+        bet_frac = np.clip(action[n:2 * n], 0.0, 1.0)
+        door_vals = np.clip(action[2 * n:], 0, self.num_doors - 1)
+        doors = np.rint(door_vals).astype(np.int32)
+
+        # BRIBE
+        obs, _, _, _, _ = self.base.step_bribe(bribe)
+
+        # SIGNAL (host: random public, true private)
+        if self.base.phase != Phase.SIGNAL:
+            raise RuntimeError("Expected Phase.SIGNAL after bribe.")
+        winning_door = self.base.current_winning_door
+        public_signal = self.base.host_action_space["public_signal"].sample()
+        private_signals = np.full(self.num_players, winning_door, dtype=np.int32)
+        obs, _, _, _, _ = self.base.step_signal(public_signal, private_signals)
+
+        # BET
+        if self.base.phase != Phase.BET:
+            raise RuntimeError("Expected Phase.BET after signal.")
+        obs, rewards, terminated, truncated, info = self.base.step_bet(doors, bet_frac)
+        reward_scalar = float(np.mean(rewards["players"]))
+        return obs["players"], reward_scalar, terminated, truncated, info
 
 
-class Critic(nn.Module):
-    def __init__(self, action_dim=1, num_doors=4):
-        super().__init__()
-        self.num_doors = num_doors
-        curr_dim = 2 * num_doors + 5
-        hist_dim = 4 * num_doors + 7
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--total_rounds", type=int, default=10000)
+    parser.add_argument("--save_every", type=int, default=50)
+    parser.add_argument("--ent_coef", type=float, default=0.00)
+    parser.add_argument("--ckpt_dir", type=str, default="./checkpoints")
+    parser.add_argument("--resume_path", type=str, default=None, help="Player checkpoint (zip) file")
+    args = parser.parse_args()
 
-        self.ext1 = TransformerExtractor(curr_dim=curr_dim, hist_dim=hist_dim)
-        self.q1_head = nn.Sequential(nn.Linear(256 + action_dim, 256), nn.ReLU(), nn.Linear(256, 1))
+    os.makedirs(args.ckpt_dir, exist_ok=True)
+    cfg = OracleGambitConfig(num_doors=3, num_players=10, max_rounds=20)
+    base_env = OracleGambitEnv(cfg)
+    player_env = PlayerEnvWrapper(base_env)
 
-        self.ext2 = TransformerExtractor(curr_dim=curr_dim, hist_dim=hist_dim)
-        self.q2_head = nn.Sequential(nn.Linear(256 + action_dim, 256), nn.ReLU(), nn.Linear(256, 1))
-
-    def forward(self, state_flat, action):
-        curr_enc, hist_enc = encode_features(state_flat, num_doors=self.num_doors)
-        feat1 = self.ext1(curr_enc, hist_enc)
-        q1 = self.q1_head(torch.cat([feat1, action], dim=-1))
-
-        feat2 = self.ext2(curr_enc, hist_enc)
-        q2 = self.q2_head(torch.cat([feat2, action], dim=-1))
-        return q1, q2
-
-
-class TwoStepReplayBuffer:
-    def __init__(self, max_size=100000, state_dim=555, num_doors=4):
-        self.s1 = np.zeros((max_size, state_dim), dtype=np.float32)
-        self.a1 = np.zeros((max_size, 1), dtype=np.float32)
-        self.r1 = np.zeros((max_size, 1), dtype=np.float32)
-        self.s2 = np.zeros((max_size, state_dim), dtype=np.float32)
-        self.a2_door = np.zeros((max_size, num_doors), dtype=np.float32)
-        self.a2_bet = np.zeros((max_size, 1), dtype=np.float32)
-        self.r2 = np.zeros((max_size, 1), dtype=np.float32)
-        self.s1_next = np.zeros((max_size, state_dim), dtype=np.float32)
-        self.done = np.zeros((max_size, 1), dtype=np.float32)
-        self.ptr, self.size, self.max_size = 0, 0, max_size
-
-    def add(self, s1, a1, r1, s2, a2_door, a2_bet, r2, s1_next, done):
-        batch_size = s1.shape[0]
-        for i in range(batch_size):
-            idx = (self.ptr + i) % self.max_size
-            self.s1[idx] = s1[i]
-            self.a1[idx] = a1[i]
-            self.r1[idx] = r1[i]
-            self.s2[idx] = s2[i]
-            self.a2_door[idx] = a2_door[i]
-            self.a2_bet[idx] = a2_bet[i]
-            self.r2[idx] = r2[i]
-            self.s1_next[idx] = s1_next[i]
-            self.done[idx] = done[i]
-        self.ptr = (self.ptr + batch_size) % self.max_size
-        self.size = min(self.size + batch_size, self.max_size)
-
-    def sample(self, batch_size, device):
-        ind = np.random.randint(0, self.size, size=batch_size)
-        return (
-            torch.as_tensor(self.s1[ind], dtype=torch.float32, device=device),
-            torch.as_tensor(self.a1[ind], dtype=torch.float32, device=device),
-            torch.as_tensor(self.r1[ind], dtype=torch.float32, device=device),
-            torch.as_tensor(self.s2[ind], dtype=torch.float32, device=device),
-            torch.as_tensor(self.a2_door[ind], dtype=torch.float32, device=device),
-            torch.as_tensor(self.a2_bet[ind], dtype=torch.float32, device=device),
-            torch.as_tensor(self.r2[ind], dtype=torch.float32, device=device),
-            torch.as_tensor(self.s1_next[ind], dtype=torch.float32, device=device),
-            torch.as_tensor(self.done[ind], dtype=torch.float32, device=device),
+    round_count = 0
+    if args.resume_path and os.path.isfile(args.resume_path):
+        print(f"Resuming player PPO from {args.resume_path}")
+        player_policy = PPO.load(args.resume_path, env=player_env, device="auto", ent_coef=args.ent_coef)
+        try:
+            base = os.path.basename(args.resume_path)
+            name = os.path.splitext(base)[0]
+            round_count = int(name.split("_")[-1])
+        except Exception:
+            round_count = 0
+    else:
+        print("Training player PPO from scratch.")
+        player_policy = PPO(
+            "MultiInputPolicy",
+            player_env,
+            policy_kwargs=dict(features_extractor_class=PlayerExtractor),
+            ent_coef=args.ent_coef,
+            verbose=1,
         )
 
+    base_env.reset()
+    while round_count < args.total_rounds:
+        player_policy.learn(total_timesteps=1, reset_num_timesteps=False)
+        if base_env.phase == Phase.BRIBE:
+            round_count += 1
+            if round_count % args.save_every == 0 and round_count > 0:
+                fname = f"{args.ckpt_dir}/player_model_honesthost_{round_count}.zip"
+                player_policy.save(fname)
+                print(f"[Saved @ round {round_count}]")
 
-def save_player_model(player_actor1, player_actor2, config, episodes, out_dir):
-    os.makedirs(out_dir, exist_ok=True)
-    player_path = os.path.join(out_dir, "player_fixed_host.pth")
-    torch.save(
-        {
-            "episode": episodes,
-            "num_doors": config.num_doors,
-            "num_players": config.num_players,
-            "player_actor1": player_actor1.state_dict(),
-            "player_actor2": player_actor2.state_dict(),
-        },
-        player_path,
-    )
-    return player_path
-
-
-def train_player_only(
-    seed=42,
-    total_bet_steps=120000,
-    batch_size=256,
-    save_every_episodes=50,
-    num_doors=4,
-):
-    set_seed(seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🚀 Training Player on device: {device}")
-
-    config = OracleGambitConfig(
-        num_players=10,
-        num_doors=num_doors,
-        max_rounds=15,
-        initial_balance=1000.0,
-        history_window=50,
-    )
-    env = OracleGambitEnv(config=config, seed=seed)
-
-    state_dim = config.current_player_dim + config.history_window * config.hist_player_dim
-
-    # 繼承 train_both 的所有 Player 超參數與獎勵塑形係數
-    bribe_log_std_min, bribe_log_std_max = -5.0, 1.0
-    bet_log_std_min, bet_log_std_max = -5.0, 1.0
-    bet_gumbel_tau = 0.8
-    player_sac_alpha = 0.10
-    grad_clip_norm = 1.0
-    phases_per_round_estimate = 4  
-    max_loop_iters = total_bet_steps * phases_per_round_estimate
-    player_truth_follow_bonus = 0.25
-    player_false_follow_penalty = 0.12
-    player_crowding_penalty = 0.20
-    player_diversity_bonus = 0.10
-    player_trust_profit_bribe_rebate = 1.25
-    player_trust_profit_follow_bonus = 0.20
-    
-    # 用於計算虛擬 Host 的 Reward (僅供日誌分析用途)
-    host_truth_private_bonus = 0.30
-    host_weighted_truth_bonus = 1.20
-    host_weighted_lie_penalty = 0.20
-    epsilon_stability = 1e-6
-
-    # 初始化 Player 兩階段 SAC 網路
-    player_actor1 = BribeActor(
-        num_doors=config.num_doors,
-        log_std_min=bribe_log_std_min,
-        log_std_max=bribe_log_std_max,
-    ).to(device)
-    player_critic1 = Critic(action_dim=1, num_doors=config.num_doors).to(device)
-    player_critic1_target = copy.deepcopy(player_critic1)
-
-    player_actor2 = BetActor(
-        num_doors=config.num_doors,
-        gumbel_tau=bet_gumbel_tau,
-        log_std_min=bet_log_std_min,
-        log_std_max=bet_log_std_max,
-    ).to(device)
-    player_critic2 = Critic(action_dim=config.num_doors + 1, num_doors=config.num_doors).to(device)
-    player_critic2_target = copy.deepcopy(player_critic2)
-
-    p_opt_a1 = optim.Adam(player_actor1.parameters(), lr=3e-4)
-    p_opt_c1 = optim.Adam(player_critic1.parameters(), lr=3e-4)
-    p_opt_a2 = optim.Adam(player_actor2.parameters(), lr=3e-4)
-    p_opt_c2 = optim.Adam(player_critic2.parameters(), lr=3e-4)
-
-    player_buffer = TwoStepReplayBuffer(max_size=100000, state_dim=state_dim, num_doors=config.num_doors)
-    p_gamma1, p_gamma2, p_tau = 0.99, 0.999, 0.005
-
-    obs, _ = env.reset()
-
-    episodes = 0
-    bet_steps = 0
-    round_in_ep = 0
-
-    # 📊 按照 train_both 的日誌統計變數
-    ep_player_reward_sum = 0.0
-    ep_host_reward_sum = 0.0
-    ep_bribe_mean_sum = 0.0
-    ep_bet_mean_sum = 0.0
-    ep_bribe_steps = 0
-    ep_bet_steps = 0
-    ep_door_counts = np.zeros(config.num_doors, dtype=np.float64)
-    ep_priv_truth_rate_sum = 0.0
-    ep_priv_follow_rate_sum = 0.0
-    ep_trust_profit_rate_sum = 0.0
-    ep_signal_steps = 0
-
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    out_dir = os.path.join(script_dir, "checkpoints")
-    os.makedirs(out_dir, exist_ok=True)
-
-    print("🔥 Start Training Player (Fixed Rule-Based Host: 10% Bribe Threshold)")
-    last_private_signals = np.zeros(config.num_players, dtype=np.int32)
-    prev_round_trust_profit_mask = np.zeros(config.num_players, dtype=np.float32)
-    last_raw_bribes_np = np.zeros(config.num_players, dtype=np.float32)
-
-    loop_iters = 0
-    while bet_steps < total_bet_steps:
-        loop_iters += 1
-        if loop_iters > max_loop_iters:
-            raise RuntimeError(f"Safety cap exceeded after {bet_steps} bet steps.")
-            
-        # ==========================================
-        # Phase 0: 賄賂階段 (Player 決策)
-        # ==========================================
-        if env.phase == Phase.BRIBE:
-            s1_dict = obs["players"]
-            s1_tensor = flatten_obs_player(s1_dict, device)
-
-            with torch.no_grad():
-                bribe_frac, _ = player_actor1.sample(s1_tensor)
-            bribe_action_np = bribe_frac.cpu().numpy().flatten()
-
-            ep_bribe_mean_sum += float(np.mean(bribe_action_np))
-            ep_bribe_steps += 1
-
-            obs, _, _, _, _ = env.step({"player_bribe_fractions": bribe_action_np})
-            current_bribes_np = env.current_bribes.copy()
-            last_raw_bribes_np = current_bribes_np.copy()
-            
-            trust_bribe_rebate = (
-                player_trust_profit_bribe_rebate
-                * prev_round_trust_profit_mask
-                * current_bribes_np
-            )
-            r1_np = -current_bribes_np + trust_bribe_rebate
-
-        # ==========================================
-        # Phase 1: 發送訊號階段 (Rule-Based Host)
-        # ==========================================
-        elif env.phase == Phase.SIGNAL:
-            # 🎯 規則 A：公頻完全隨機
-            pub_act = random.randint(0, config.num_doors - 1)
-            winning_door = env.current_winning_door
-            
-            # 安全獲取所有玩家當下的手頭資金 (Balance)
-            if hasattr(env, 'balances'):
-                balances = env.balances
-            else:
-                balances = obs["players"]["current"][:, 1]
-                
-            bribes = env.current_bribes
-            
-            # 🎯 規則 B：當賄賂金額超過玩家手上資產的 10% 時，私頻才給真的答案，否則隨機給門
-            priv_acts = []
-            for i in range(config.num_players):
-                priv_acts.append(winning_door)
-                # if bribes[i] > 0.10 * balances[i]:
-                #     priv_acts.append(winning_door)
-                # else:
-                #     priv_acts.append(random.randint(0, config.num_doors - 1))
-                    
-
-            host_action = {
-                "public_signal": pub_act,
-                "private_signals": np.array(priv_acts, dtype=np.int32),
-            }
-            last_private_signals = host_action["private_signals"].copy()
-
-            if winning_door >= 0:
-                ep_priv_truth_rate_sum += float(np.mean(np.array(priv_acts) == winning_door))
-                ep_signal_steps += 1
-
-            obs, _, _, _, _ = env.step(host_action)
-            s2_dict = obs["players"]
-            s2_tensor = flatten_obs_player(s2_dict, device)
-
-        # ==========================================
-        # Phase 2: 下注階段 (Player 決策) & 結算
-        # ==========================================
-        elif env.phase == Phase.BET:
-            with torch.no_grad():
-                door_idx, door_onehot, bet_frac, _ = player_actor2.sample(s2_tensor)
-
-            door_idx_np = door_idx.cpu().numpy()
-            bet_frac_np = bet_frac.cpu().numpy().flatten()
-
-            ep_bet_mean_sum += float(np.mean(bet_frac_np))
-            ep_bet_steps += 1
-            for d in door_idx_np:
-                ep_door_counts[int(d)] += 1
-
-            next_obs, rewards, terminated, truncated, info = env.step(
-                {
-                    "player_doors": door_idx_np,
-                    "bet_fractions": bet_frac_np,
-                }
-            )
-
-            bet_steps += 1
-            round_in_ep += 1
-
-            winning_door = int(info["winning_door"])
-            private_is_truth = (last_private_signals == winning_door).astype(np.float32)
-            private_truth_rate = float(np.mean(private_is_truth))
-            bribe_weights = np.maximum(last_raw_bribes_np, 0.0).astype(np.float32)
-            bribe_weight_sum = float(np.sum(bribe_weights))
-            if bribe_weight_sum > epsilon_stability:
-                bribe_weighted_truth_rate = float(
-                    np.sum(bribe_weights * private_is_truth) / bribe_weight_sum
-                )
-            else:
-                bribe_weighted_truth_rate = private_truth_rate
-            bribe_weighted_lie_rate = 1.0 - bribe_weighted_truth_rate
-            
-            # 計算虛擬 Host 得分 (維持 train_both 對應數值統計指標)
-            last_host_reward = (
-                float(rewards["host"])
-                + host_truth_private_bonus * private_truth_rate
-                + host_weighted_truth_bonus * bribe_weighted_truth_rate
-                - host_weighted_lie_penalty * bribe_weighted_lie_rate
-            )
-
-            total_rewards_np = rewards["players"]
-            
-            # 📊 核心記錄點：計算並追蹤有多少比例的 Player 選擇跟著 Host 的私頻下注
-            follow_private = (door_idx_np == last_private_signals).astype(np.float32)
-            ep_priv_follow_rate_sum += float(np.mean(follow_private))
-            
-            # 完整繼承 train_both 的內部獎勵塑形機制
-            truth_follow_bonus = player_truth_follow_bonus * (private_is_truth * follow_private)
-            false_follow_penalty = player_false_follow_penalty * ((1.0 - private_is_truth) * follow_private)
-            trust_profit_follow_bonus = (
-                player_trust_profit_follow_bonus * (prev_round_trust_profit_mask * follow_private)
-            )
-            door_ratios = env.hist_door_ratios[-1]
-            chosen_door_ratios = np.array([door_ratios[d] for d in door_idx_np], dtype=np.float32)
-            diversity_bonus = player_diversity_bonus * (1.0 - chosen_door_ratios)
-            
-            shaped_player_rewards = (
-                total_rewards_np
-                + truth_follow_bonus
-                + trust_profit_follow_bonus
-                + diversity_bonus
-                - false_follow_penalty
-                - player_crowding_penalty * chosen_door_ratios
-            )
-            
-            prev_round_trust_profit_mask = (
-                private_is_truth * (total_rewards_np > 0.0).astype(np.float32)
-            )
-            ep_trust_profit_rate_sum += float(np.mean(prev_round_trust_profit_mask))
-            r2_np = shaped_player_rewards - r1_np
-            r2_np *= 0.1
-
-            s1_next_dict = next_obs["players"]
-            s1_next_tensor = flatten_obs_player(s1_next_dict, device)
-            done_arr = np.full((config.num_players, 1), float(terminated or truncated), dtype=np.float32)
-
-            player_buffer.add(
-                s1_tensor.cpu().numpy(),
-                bribe_frac.cpu().numpy(),
-                r1_np.reshape(-1, 1),
-                s2_tensor.cpu().numpy(),
-                door_onehot.cpu().numpy(),
-                bet_frac.cpu().numpy(),
-                r2_np.reshape(-1, 1),
-                s1_next_tensor.cpu().numpy(),
-                done_arr,
-            )
-
-            ep_player_reward_sum += float(np.mean(shaped_player_rewards))
-            ep_host_reward_sum += last_host_reward
-            obs = next_obs
-
-            # ---------------------------------------------
-            # Player SAC 網路更新階段 (時序差分鎖鏈閉環)
-            # ---------------------------------------------
-            if player_buffer.size >= batch_size * 2:
-                s1, a1, r1, s2, a2_door, a2_bet, r2, s1_next, done = player_buffer.sample(batch_size, device)
-                a2 = torch.cat([a2_door, a2_bet], dim=-1)
-
-                with torch.no_grad():
-                    next_a1, next_log_pi1 = player_actor1.sample(s1_next)
-                    target_q1_a, target_q1_b = player_critic1_target(s1_next, next_a1)
-                    target_v1 = torch.min(target_q1_a, target_q1_b) - player_sac_alpha * next_log_pi1
-                    target_q2 = r2 + p_gamma1 * (1 - done) * target_v1
-
-                current_q2_a, current_q2_b = player_critic2(s2, a2)
-                q2_loss = F.mse_loss(current_q2_a, target_q2) + F.mse_loss(current_q2_b, target_q2)
-                p_opt_c2.zero_grad()
-                q2_loss.backward()
-                torch.nn.utils.clip_grad_norm_(player_critic2.parameters(), max_norm=grad_clip_norm)
-                p_opt_c2.step()
-
-                with torch.no_grad():
-                    _, next_door_onehot, next_bet_frac, next_log_pi2 = player_actor2.sample(s2)
-                    next_a2 = torch.cat([next_door_onehot, next_bet_frac], dim=-1)
-                    target_q2_a, target_q2_b = player_critic2_target(s2, next_a2)
-                    target_v2 = torch.min(target_q2_a, target_q2_b) - player_sac_alpha * next_log_pi2
-                    target_q1 = r1 + p_gamma2 * target_v2
-
-                current_q1_a, current_q1_b = player_critic1(s1, a1)
-                q1_loss = F.mse_loss(current_q1_a, target_q1) + F.mse_loss(current_q1_b, target_q1)
-                p_opt_c1.zero_grad()
-                q1_loss.backward()
-                torch.nn.utils.clip_grad_norm_(player_critic1.parameters(), max_norm=grad_clip_norm)
-                p_opt_c1.step()
-
-                _, curr_door_onehot, curr_bet_frac, log_pi2 = player_actor2.sample(s2)
-                curr_a2 = torch.cat([curr_door_onehot, curr_bet_frac], dim=-1)
-                q2_pi_a, q2_pi_b = player_critic2(s2, curr_a2)
-                a2_loss = (player_sac_alpha * log_pi2 - torch.min(q2_pi_a, q2_pi_b)).mean()
-                p_opt_a2.zero_grad()
-                a2_loss.backward()
-                torch.nn.utils.clip_grad_norm_(player_actor2.parameters(), max_norm=grad_clip_norm)
-                p_opt_a2.step()
-
-                curr_a1, log_pi1 = player_actor1.sample(s1)
-                q1_pi_a, q1_pi_b = player_critic1(s1, curr_a1)
-                a1_loss = (player_sac_alpha * log_pi1 - torch.min(q1_pi_a, q1_pi_b)).mean()
-                p_opt_a1.zero_grad()
-                a1_loss.backward()
-                torch.nn.utils.clip_grad_norm_(player_actor1.parameters(), max_norm=grad_clip_norm)
-                p_opt_a1.step()
-
-                for p, tp in zip(player_critic1.parameters(), player_critic1_target.parameters()):
-                    tp.data.copy_(p_tau * p.data + (1 - p_tau) * tp.data)
-                for p, tp in zip(player_critic2.parameters(), player_critic2_target.parameters()):
-                    tp.data.copy_(p_tau * p.data + (1 - p_tau) * tp.data)
-
-            # ==========================================
-            # 回合(Episode) 結束處理與完整日誌輸出
-            # ==========================================
-            if terminated or truncated:
-                episodes += 1
-
-                total_doors = np.sum(ep_door_counts) + epsilon_stability
-                door_pct = (ep_door_counts / total_doors) * 100.0
-                avg_bribe = ep_bribe_mean_sum / max(1, ep_bribe_steps)
-                avg_bet = ep_bet_mean_sum / max(1, ep_bet_steps)
-                avg_priv_truth = ep_priv_truth_rate_sum / max(1, ep_signal_steps)
-                avg_priv_follow = ep_priv_follow_rate_sum / max(1, ep_signal_steps)
-                avg_trust_profit = ep_trust_profit_rate_sum / max(1, ep_signal_steps)
-                avg_player_reward = ep_player_reward_sum / max(1, round_in_ep)
-
-                door_str = " | ".join(
-                    [f"{chr(65 + i)}: {door_pct[i]:5.1f}%" for i in range(config.num_doors)]
-                )
-                
-                # 📊 完全參照 train_both 的對齊格式，包含 PrivFollow 核心分析數據
-                print(
-                    f"✅ Ep {episodes:4d} | Rounds {round_in_ep:3d} | "
-                    f"P_Reward: {avg_player_reward:+.2f} | H_Reward: {ep_host_reward_sum:+.2f}"
-                )
-                print(
-                    f"   📊 Avg BribeFrac: {avg_bribe:.3f} | Avg BetFrac: {avg_bet:.3f} | "
-                    f"PrivTruth: {avg_priv_truth:.3f} | PrivFollow: {avg_priv_follow:.3f} | "
-                    f"TrustProfit: {avg_trust_profit:.3f}"
-                )
-                print(f"   🚪 Doors: {door_str}")
-                print("-" * 70)
-
-                if episodes % save_every_episodes == 0:
-                    player_path = save_player_model(
-                        player_actor1,
-                        player_actor2,
-                        config,
-                        episodes,
-                        out_dir,
-                    )
-                    print(f"💾 Model Saved: {player_path}")
-
-                # 重置環境與統計指標
-                obs, _ = env.reset()
-                round_in_ep = 0
-                ep_player_reward_sum = 0.0
-                ep_host_reward_sum = 0.0
-                ep_bribe_mean_sum = 0.0
-                ep_bet_mean_sum = 0.0
-                ep_bribe_steps = 0
-                ep_bet_steps = 0
-                ep_signal_steps = 0
-                ep_priv_truth_rate_sum = 0.0
-                ep_priv_follow_rate_sum = 0.0
-                ep_trust_profit_rate_sum = 0.0
-                ep_door_counts.fill(0.0)
-                prev_round_trust_profit_mask.fill(0.0)
-                last_private_signals.fill(0)
-                last_raw_bribes_np.fill(0.0)
-
-    player_path = save_player_model(player_actor1, player_actor2, config, episodes, out_dir)
-    print(f"✅ Training done. Final Player model saved to:\n - {player_path}")
-
+    player_policy.save(f"{args.ckpt_dir}/player_model_honesthost_{round_count}.zip")
+    print(f"Training complete. Final checkpoint saved at round {round_count}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--num-doors", type=int, default=4, help="Door count for training")
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--total-bet-steps", type=int, default=120000)
-    parser.add_argument("--batch-size", type=int, default=256)
-    parser.add_argument("--save-every-episodes", type=int, default=50)
-    args = parser.parse_args()
-    
-    train_player_only(
-        seed=args.seed,
-        total_bet_steps=args.total_bet_steps,
-        batch_size=args.batch_size,
-        save_every_episodes=args.save_every_episodes,
-        num_doors=args.num_doors,
-    )
+    main()
