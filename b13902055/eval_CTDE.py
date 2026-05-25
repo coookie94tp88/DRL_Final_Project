@@ -255,7 +255,7 @@ def evaluate_checkpoint(
     checkpoint_episode = parse_checkpoint_episode(checkpoint_path)
     return {
         "checkpoint": checkpoint_path,
-        "checkpoint_episode": checkpoint_episode if checkpoint_episode is not None else -1,
+        "checkpoint_episode": checkpoint_episode,
         "episodes": args.episodes,
         "total_rounds": total_rounds,
         "avg_bet": total_avg_bet_sum / max(1, total_rounds),
@@ -282,8 +282,9 @@ def print_summary_table(console: Console, rows: list[dict]) -> None:
     table.add_column("player_follow_priv_rate", justify="right")
 
     for row in rows:
+        episode_label = "-" if row["checkpoint_episode"] is None else str(int(row["checkpoint_episode"]))
         table.add_row(
-            str(int(row["checkpoint_episode"])),
+            episode_label,
             os.path.basename(row["checkpoint"]),
             str(int(row["episodes"])),
             str(int(row["total_rounds"])),
@@ -306,7 +307,14 @@ def write_summary_csv(path: str, rows: list[dict]) -> None:
 
 
 def plot_summary_figure(rows: list[dict], output_path: str, title: str) -> None:
-    x = np.asarray([int(r["checkpoint_episode"]) for r in rows], dtype=np.int32)
+    episodes = [r["checkpoint_episode"] for r in rows]
+    has_missing_episode = any(ep is None for ep in episodes)
+    if has_missing_episode:
+        x = np.arange(1, len(rows) + 1, dtype=np.int32)
+        x_label = "Checkpoint Index"
+    else:
+        x = np.asarray([int(ep) for ep in episodes], dtype=np.int32)
+        x_label = "Checkpoint Episode"
     host_reward = np.asarray([float(r["host_final_reward"]) for r in rows], dtype=np.float32)
     player_reward = np.asarray([float(r["player_final_reward"]) for r in rows], dtype=np.float32)
     avg_bribe = np.asarray([float(r["avg_bribe"]) for r in rows], dtype=np.float32)
@@ -321,7 +329,7 @@ def plot_summary_figure(rows: list[dict], output_path: str, title: str) -> None:
     ax.plot(x, player_reward, marker="o", linewidth=2, label="Player Final Reward")
     ax.axhline(0.0, color="gray", linewidth=1, linestyle="--")
     ax.set_title("Final Rewards vs Checkpoint")
-    ax.set_xlabel("Checkpoint Episode")
+    ax.set_xlabel(x_label)
     ax.set_ylabel("Reward")
     ax.grid(True, alpha=0.3)
     ax.legend()
@@ -330,7 +338,7 @@ def plot_summary_figure(rows: list[dict], output_path: str, title: str) -> None:
     ax.plot(x, avg_bribe, marker="o", linewidth=2, label="Avg Bribe")
     ax.plot(x, avg_bet, marker="o", linewidth=2, label="Avg Bet")
     ax.set_title("Average Bribe / Bet vs Checkpoint")
-    ax.set_xlabel("Checkpoint Episode")
+    ax.set_xlabel(x_label)
     ax.set_ylabel("Fraction")
     ax.set_ylim(0.0, 1.05)
     ax.grid(True, alpha=0.3)
@@ -339,7 +347,7 @@ def plot_summary_figure(rows: list[dict], output_path: str, title: str) -> None:
     ax = axes[1, 0]
     ax.plot(x, host_true_priv, marker="o", linewidth=2, label="Host True Private Signal Rate")
     ax.set_title("Host True Private Signal Rate")
-    ax.set_xlabel("Checkpoint Episode")
+    ax.set_xlabel(x_label)
     ax.set_ylabel("Rate")
     ax.set_ylim(0.0, 1.05)
     ax.grid(True, alpha=0.3)
@@ -348,7 +356,7 @@ def plot_summary_figure(rows: list[dict], output_path: str, title: str) -> None:
     ax = axes[1, 1]
     ax.plot(x, player_follow_priv, marker="o", linewidth=2, color="tab:green", label="Player Follow Private Signal Rate")
     ax.set_title("Player Follow Private Signal Rate")
-    ax.set_xlabel("Checkpoint Episode")
+    ax.set_xlabel(x_label)
     ax.set_ylabel("Rate")
     ax.set_ylim(0.0, 1.05)
     ax.grid(True, alpha=0.3)
@@ -435,11 +443,11 @@ def main() -> None:
             checkpoint_path=ckpt,
             args=args,
             console=console,
-            show_round_log=bool(args.render_round_log and len(checkpoints) == 1),
+            show_round_log=args.render_round_log and len(checkpoints) == 1,
         )
         rows.append(row)
 
-    rows.sort(key=lambda x: x["checkpoint_episode"])
+    rows.sort(key=lambda x: x["checkpoint_episode"] if x["checkpoint_episode"] is not None else 10**12)
     print_summary_table(console, rows)
     if args.output_csv:
         write_summary_csv(args.output_csv, rows)
