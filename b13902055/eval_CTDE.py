@@ -4,6 +4,7 @@ import os
 import re
 from pathlib import Path
 
+import matplotlib.pyplot as plt
 import numpy as np
 from rich.console import Console
 from rich.panel import Panel
@@ -304,6 +305,64 @@ def write_summary_csv(path: str, rows: list[dict]) -> None:
             writer.writerow({k: row[k] for k in METRIC_COLUMNS})
 
 
+def plot_summary_figure(rows: list[dict], output_path: str, title: str) -> None:
+    x = np.asarray([int(r["checkpoint_episode"]) for r in rows], dtype=np.int32)
+    host_reward = np.asarray([float(r["host_final_reward"]) for r in rows], dtype=np.float32)
+    player_reward = np.asarray([float(r["player_final_reward"]) for r in rows], dtype=np.float32)
+    avg_bribe = np.asarray([float(r["avg_bribe"]) for r in rows], dtype=np.float32)
+    avg_bet = np.asarray([float(r["avg_bet"]) for r in rows], dtype=np.float32)
+    host_true_priv = np.asarray([float(r["host_true_private_signal_rate"]) for r in rows], dtype=np.float32)
+    player_follow_priv = np.asarray([float(r["player_follow_private_signal_rate"]) for r in rows], dtype=np.float32)
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8), constrained_layout=True)
+
+    ax = axes[0, 0]
+    ax.plot(x, host_reward, marker="o", linewidth=2, label="Host Final Reward")
+    ax.plot(x, player_reward, marker="o", linewidth=2, label="Player Final Reward")
+    ax.axhline(0.0, color="gray", linewidth=1, linestyle="--")
+    ax.set_title("Final Rewards vs Checkpoint")
+    ax.set_xlabel("Checkpoint Episode")
+    ax.set_ylabel("Reward")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    ax = axes[0, 1]
+    ax.plot(x, avg_bribe, marker="o", linewidth=2, label="Avg Bribe")
+    ax.plot(x, avg_bet, marker="o", linewidth=2, label="Avg Bet")
+    ax.set_title("Average Bribe / Bet vs Checkpoint")
+    ax.set_xlabel("Checkpoint Episode")
+    ax.set_ylabel("Fraction")
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    ax = axes[1, 0]
+    ax.plot(x, host_true_priv, marker="o", linewidth=2, label="Host True Private Signal Rate")
+    ax.set_title("Host True Private Signal Rate")
+    ax.set_xlabel("Checkpoint Episode")
+    ax.set_ylabel("Rate")
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    ax = axes[1, 1]
+    ax.plot(x, player_follow_priv, marker="o", linewidth=2, color="tab:green", label="Player Follow Private Signal Rate")
+    ax.set_title("Player Follow Private Signal Rate")
+    ax.set_xlabel("Checkpoint Episode")
+    ax.set_ylabel("Rate")
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    fig.suptitle(title)
+    output_file = os.path.abspath(os.path.expanduser(output_path))
+    output_dir = os.path.dirname(output_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    fig.savefig(output_file, dpi=180)
+    plt.close(fig)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -333,6 +392,9 @@ def main() -> None:
     parser.add_argument("--stochastic", action="store_true")
     parser.add_argument("--render-round-log", action="store_true", help="Print per-round details while evaluating")
     parser.add_argument("--output-csv", type=str, default=None, help="Optional CSV path for summary table")
+    parser.add_argument("--no-figure", action="store_true", help="Disable figure generation")
+    parser.add_argument("--figure-path", type=str, default=None, help="Optional output path for summary figure (.png)")
+    parser.add_argument("--figure-title", type=str, default="CTDE Checkpoint Evaluation", help="Title for generated figure")
     args = parser.parse_args()
 
     console = Console()
@@ -382,6 +444,14 @@ def main() -> None:
     if args.output_csv:
         write_summary_csv(args.output_csv, rows)
         console.print(f"[green]Summary CSV saved to {args.output_csv}[/green]")
+    if not args.no_figure:
+        default_figure_path = os.path.join(
+            os.path.abspath(os.path.expanduser(args.checkpoint_dir)),
+            "eval_ctde_summary.png",
+        )
+        figure_path = args.figure_path if args.figure_path else default_figure_path
+        plot_summary_figure(rows=rows, output_path=figure_path, title=args.figure_title)
+        console.print(f"[green]Summary figure saved to {os.path.abspath(os.path.expanduser(figure_path))}[/green]")
 
 
 if __name__ == "__main__":
