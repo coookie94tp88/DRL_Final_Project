@@ -131,7 +131,7 @@ def find_checkpoints(
     end_ep: int | None,
     ep_step: int,
 ) -> list[str]:
-    root = Path(checkpoint_dir)
+    root = Path(os.path.abspath(os.path.expanduser(checkpoint_dir)))
     if not root.exists():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_dir}")
 
@@ -201,7 +201,8 @@ def evaluate_checkpoint(
         ep_player_reward = 0.0
         ep_host_reward = 0.0
         rounds = 0
-        console.print(f"\n[bold yellow]Starting Episode {ep}/{args.episodes}[/bold yellow]")
+        if show_round_log:
+            console.print(f"\n[bold yellow]Starting Episode {ep}/{args.episodes}[/bold yellow]")
 
         while True:
             if env.phase == Phase.BRIBE:
@@ -238,9 +239,9 @@ def evaluate_checkpoint(
                 if terminated or truncated:
                     if show_round_log:
                         console.print(
-                        f"\n[bold yellow]Episode {ep} Over at Round {rounds}![/bold yellow]\n"
-                        f"[cyan]Episode return[/cyan] "
-                        f"player={ep_player_reward:+.2f} host={ep_host_reward:+.2f}"
+                            f"\n[bold yellow]Episode {ep} Over at Round {rounds}![/bold yellow]\n"
+                            f"[cyan]Episode return[/cyan] "
+                            f"player={ep_player_reward:+.2f} host={ep_host_reward:+.2f}"
                         )
                     break
             else:
@@ -315,7 +316,7 @@ def main() -> None:
     parser.add_argument(
         "--checkpoint-dir",
         type=str,
-        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints_ctde"),
+        default="./checkpoints_ctde",
         help="Directory to discover checkpoints named ctde_ep_xx.pt",
     )
     parser.add_argument("--start-ep", type=int, default=None, help="Start checkpoint episode (inclusive)")
@@ -338,7 +339,10 @@ def main() -> None:
     deterministic = not args.stochastic
 
     if args.checkpoint_path:
-        checkpoints = [args.checkpoint_path]
+        checkpoint_path = os.path.abspath(os.path.expanduser(args.checkpoint_path))
+        if not os.path.isfile(checkpoint_path):
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+        checkpoints = [checkpoint_path]
     else:
         checkpoints = find_checkpoints(
             checkpoint_dir=args.checkpoint_dir,
