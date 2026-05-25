@@ -447,6 +447,7 @@ def main() -> None:
         )
         rows.append(row)
 
+    # Put checkpoints without parsable `ctde_ep_<n>.pt` episode numbers at the end.
     rows.sort(key=lambda x: x["checkpoint_episode"] if x["checkpoint_episode"] is not None else float("inf"))
     print_summary_table(console, rows)
     if args.output_csv:
