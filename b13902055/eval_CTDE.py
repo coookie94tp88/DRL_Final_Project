@@ -313,6 +313,7 @@ def plot_summary_figure(rows: list[dict], output_path: str, title: str) -> None:
         x = np.arange(1, len(rows) + 1, dtype=np.int32)
         x_label = "Checkpoint Index"
     else:
+        assert all(ep is not None for ep in episodes)
         x = np.asarray([int(ep) for ep in episodes], dtype=np.int32)
         x_label = "Checkpoint Episode"
     host_reward = np.asarray([float(r["host_final_reward"]) for r in rows], dtype=np.float32)
@@ -448,7 +449,7 @@ def main() -> None:
         rows.append(row)
 
     # Put checkpoints without parsable `ctde_ep_<n>.pt` episode numbers at the end.
-    rows.sort(key=lambda x: x["checkpoint_episode"] if x["checkpoint_episode"] is not None else float("inf"))
+    rows.sort(key=lambda x: (x["checkpoint_episode"] is None, x["checkpoint_episode"] or 0))
     print_summary_table(console, rows)
     if args.output_csv:
         write_summary_csv(args.output_csv, rows)
