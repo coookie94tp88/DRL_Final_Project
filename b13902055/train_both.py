@@ -2,6 +2,7 @@ import os
 import csv
 os.environ["MPLCONFIGDIR"] = "/tmp/mpl_cache"
 
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
@@ -39,6 +40,67 @@ def _print_metric_row(prefix, row):
         f"host_true_private_signal_rate={row['host_true_private_signal_rate']:.3f} | "
         f"player_follow_private_signal_rate={row['player_follow_private_signal_rate']:.3f}"
     )
+
+
+def _save_metrics_figure(path, rows):
+    if not rows:
+        return
+
+    steps = np.asarray([int(r["step"]) for r in rows], dtype=np.int32)
+    host_reward = np.asarray([float(r["host_final_reward"]) for r in rows], dtype=np.float32)
+    player_reward = np.asarray([float(r["player_final_reward"]) for r in rows], dtype=np.float32)
+    avg_bribe = np.asarray([float(r["avg_bribe"]) for r in rows], dtype=np.float32)
+    avg_bet = np.asarray([float(r["avg_bet"]) for r in rows], dtype=np.float32)
+    host_truth = np.asarray([float(r["host_true_private_signal_rate"]) for r in rows], dtype=np.float32)
+    player_follow = np.asarray([float(r["player_follow_private_signal_rate"]) for r in rows], dtype=np.float32)
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8), constrained_layout=True)
+
+    ax = axes[0, 0]
+    ax.plot(steps, host_reward, label="Host Final Reward", linewidth=2)
+    ax.plot(steps, player_reward, label="Player Final Reward", linewidth=2)
+    ax.axhline(0.0, color="gray", linewidth=1, linestyle="--")
+    ax.set_title("Final Rewards vs Step")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Reward")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    ax = axes[0, 1]
+    ax.plot(steps, avg_bribe, label="Avg Bribe", linewidth=2)
+    ax.plot(steps, avg_bet, label="Avg Bet", linewidth=2)
+    ax.set_title("Average Bribe / Bet vs Step")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Fraction")
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    ax = axes[1, 0]
+    ax.plot(steps, host_truth, label="Host True Private Signal Rate", linewidth=2)
+    ax.set_title("Host True Private Signal Rate")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Rate")
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    ax = axes[1, 1]
+    ax.plot(steps, player_follow, color="tab:green", label="Player Follow Private Signal Rate", linewidth=2)
+    ax.set_title("Player Follow Private Signal Rate")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Rate")
+    ax.set_ylim(0.0, 1.05)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    fig.suptitle("Training Metrics Summary")
+    output_file = os.path.abspath(os.path.expanduser(path))
+    output_dir = os.path.dirname(output_file)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+    fig.savefig(output_file, dpi=180)
+    plt.close(fig)
 
 
 # -----------------------------
@@ -227,6 +289,7 @@ def train(
 
     os.makedirs(ckpt_dir, exist_ok=True)
     metrics_path = os.path.join(ckpt_dir, "training_metrics.csv")
+    metrics_figure_path = os.path.join(ckpt_dir, "training_metrics.png")
     metrics_rows = []
     cfg = OracleGambitConfig(num_doors=3, num_players=10, max_rounds=20)
     base_env = OracleGambitEnv(cfg)
@@ -280,6 +343,7 @@ def train(
             player_policy.save(player_save_path)
             torch.save(host_policy.state_dict(), host_save_path)
             _save_metrics_csv(metrics_path, metrics_rows)
+            _save_metrics_figure(metrics_figure_path, metrics_rows)
             if metrics_rows:
                 _print_metric_row("[Metrics]", metrics_rows[-1])
             print(f"[Saved @ round {round_count}]")
@@ -289,9 +353,11 @@ def train(
     player_policy.save(player_save_path)
     torch.save(host_policy.state_dict(), host_save_path)
     _save_metrics_csv(metrics_path, metrics_rows)
+    _save_metrics_figure(metrics_figure_path, metrics_rows)
     if metrics_rows:
         _print_metric_row("[Metrics]", metrics_rows[-1])
     print(f"Metrics saved to {metrics_path}")
+    print(f"Metrics figure saved to {metrics_figure_path}")
     print(f"Training complete. Final checkpoint saved at round {round_count}")
 
 
