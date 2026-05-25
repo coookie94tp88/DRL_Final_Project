@@ -447,7 +447,7 @@ def main() -> None:
         )
         rows.append(row)
 
-    rows.sort(key=lambda x: x["checkpoint_episode"] if x["checkpoint_episode"] is not None else 10**12)
+    rows.sort(key=lambda x: x["checkpoint_episode"] if x["checkpoint_episode"] is not None else float("inf"))
     print_summary_table(console, rows)
     if args.output_csv:
         write_summary_csv(args.output_csv, rows)
