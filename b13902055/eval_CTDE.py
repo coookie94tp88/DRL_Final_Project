@@ -4,6 +4,8 @@ import os
 import re
 from pathlib import Path
 
+os.environ["MPLCONFIGDIR"] = "/tmp/mpl_cache"
+
 import matplotlib.pyplot as plt
 import numpy as np
 from rich.console import Console
@@ -14,9 +16,6 @@ from rich.text import Text
 from env import OracleGambitConfig, OracleGambitEnv, Phase
 from host_CTDE_agent import TrainedCTDEHostAgent
 from player_CTDE_agent import TrainedCTDEPlayerAgent
-
-os.environ["MPLCONFIGDIR"] = "/tmp/mpl_cache"
-
 
 METRIC_COLUMNS = [
     "checkpoint",
