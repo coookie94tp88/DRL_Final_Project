@@ -1,0 +1,109 @@
+\documentclass[11pt,a4paper]{article}
+
+% ── packages ──────────────────────────────────────────────────
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{xcolor}
+
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+% ── figure path ───────────────────────────────────────────────
+\graphicspath{{../checkpoints/curriculum/}}
+
+% ── document ──────────────────────────────────────────────────
+\begin{document}
+
+% ============================================================
+\section{Preliminary Experiment}
+\label{sec:prelim}
+% ============================================================
+
+To validate the core game dynamics and verify that curriculum training can
+induce a strategically coherent equilibrium, we conducted a preliminary
+experiment using a lighter architecture---a multi-layer perceptron (MLP)
+with REINFORCE---on a version of OracleGambit without the balance system.
+Training proceeded in three phases (Fig.~\ref{fig:overview}).
+
+\paragraph{Phase A -- Honest Host, Players Only.}
+The host was fixed as a perfectly honest oracle ($\text{Honesty}=1.0$)
+and only the players were trained.
+Across 18{,}048 rounds, the follow rate rose from $0.25$ (random chance)
+to $0.69$, with the win rate matching it exactly---confirming that players
+successfully learned to exploit a truthful signal.
+
+\paragraph{Phase B -- Deceptive Host, Host Only.}
+Players were frozen and only the host was trained to maximise its own
+reward by deceiving players.
+Over rounds 20{,}096--42{,}112, signal honesty collapsed from $0.24$ to
+$0.04$, while the host's win rate dropped from $0.24$ to $0.11$.
+This seemingly counterintuitive result arises because the frozen players
+continued to follow a signal that was now systematically false, driving
+both parties toward anti-coordinated outcomes.
+
+\paragraph{Phase C -- Joint Training (500 checkpoints).}
+Both agents were unfrozen and trained simultaneously for over one million
+rounds (44{,}160--1{,}042{,}176).
+As shown in Fig.~\ref{fig:honesty_follow}, an \emph{adversarial phase}
+dominated early Phase C: the host briefly exploited residual player trust
+(follow rate $\approx 0.56$ at the phase start) before players adapted.
+The gap $\Delta = \text{Follow Rate} - \text{Signal Honesty}$ oscillated
+around zero and steadily contracted (Fig.~\ref{fig:delta}),
+ultimately converging to the theoretical mixed-strategy Nash equilibrium
+at $\text{Honesty} \approx \text{Follow Rate} \approx 0.25$---equal to
+the random-chance baseline of $1/D$ ($D=4$ doors).
+
+These results confirm that (i) the zero-sum payout formula is correctly
+implemented, (ii) curriculum shaping is necessary to avoid trivial
+convergence, and (iii) the system reliably finds the mixed-strategy
+equilibrium under joint training.
+
+% ---- Figure 1: Full Overview --------------------------------
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{fig_overview.pdf}
+  \caption{%
+    \textbf{Curriculum training overview (MLP+REINFORCE, pre-balance).}
+    Win rate, signal honesty, and follow rate across all three phases.
+    Shaded regions indicate Phase~A (blue), Phase~B (orange), and
+    Phase~C (green); dashed vertical lines mark phase transitions.
+    The grey dashed line marks the random-chance baseline ($0.25$).
+  }
+  \label{fig:overview}
+\end{figure}
+
+% ---- Figure 2: Phase C Honesty vs Follow Rate ---------------
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{fig_honesty_follow.pdf}
+  \caption{%
+    \textbf{Phase C -- Signal Honesty vs.\ Follow Rate.}
+    Thin lines show raw per-checkpoint values; thick lines show
+    MA-15 smoothed trends.
+    Red shading indicates periods when players over-trust the host
+    (\emph{follow $>$ honesty}); blue shading indicates under-trust.
+    Both metrics converge to the mixed Nash equilibrium at $\approx 0.25$.
+  }
+  \label{fig:honesty_follow}
+\end{figure}
+
+% ---- Figure 3: Phase C Delta --------------------------------
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=\linewidth]{fig_delta.pdf}
+  \caption{%
+    \textbf{Phase C -- $\Delta = \text{Follow Rate} - \text{Signal Honesty}$.}
+    The dotted line shows the MA-50 trend.
+    The orange band marks the early adversarial phase (large oscillations);
+    the blue band marks convergence toward Nash equilibrium ($\Delta \to 0$).
+  }
+  \label{fig:delta}
+\end{figure}
+
+\end{document}

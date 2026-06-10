@@ -96,14 +96,15 @@ def main(args: argparse.Namespace) -> None:
     env.reset(seed=args.seed)
 
     D  = env.num_doors
-    host_obs_dim   = env.observation_space("host").shape[0]
-    player_obs_dim = env.observation_space("player_0").shape[0]
+    NF = env.num_bet_fracs
 
-    # hist_feat_size: derived from env structure, not exposed as CLI args
-    #   host   obs = history(50×4) + mask(50) + current(5) = 255
-    #   player obs = history(50×8) + mask(50) + current(5) = 455
-    HOST_HIST_FEAT   = 4
-    PLAYER_HIST_FEAT = 8
+    # Obs dims are now computed by the env and exposed as attributes
+    host_obs_dim       = env.host_obs_size        # L*5 + L + D + NF + 1
+    pre_signal_obs_dim = env.pre_signal_obs_size  # L*(6+D) + L + 2
+    door_obs_dim       = env.door_obs_size        # L*(6+D) + L + D + 3
+
+    HOST_HIST_FEAT   = 5        # correct_door, signal, honest, win_ratio, avg_bet_frac
+    PLAYER_HIST_FEAT = 5 + D   # bet_frac, door, signal, followed, won, door_ratios(D)
 
     # ── Agents ───────────────────────────────────────────────────────────
     host_agent = TransformerAgent(
@@ -118,8 +119,20 @@ def main(args: argparse.Namespace) -> None:
         hidden_dim     = 128,
     )
 
-    player_agent = TransformerAgent(
-        obs_dim        = player_obs_dim,
+    bet_agent = TransformerAgent(
+        obs_dim        = pre_signal_obs_dim,
+        num_doors      = NF,          # NF discrete bet-fraction levels
+        hist_feat_size = PLAYER_HIST_FEAT,
+        history_window = 50,
+        d_model        = args.d_model,
+        nhead          = args.nhead,
+        num_enc_layers = args.num_layers,
+        ff_dim         = args.d_model * 4,
+        hidden_dim     = 128,
+    )
+
+    door_agent = TransformerAgent(
+        obs_dim        = door_obs_dim,
         num_doors      = D,
         hist_feat_size = PLAYER_HIST_FEAT,
         history_window = 50,
@@ -131,14 +144,19 @@ def main(args: argparse.Namespace) -> None:
     )
 
     print("=" * 60)
-    print("OracleGambit  Phase 2 — Transformer + PPO")
+    print("OracleGambit  Phase 2 — Transformer + PPO  (Balance System)")
     print("=" * 60)
     print(f"  Players         : {args.players}")
     print(f"  Doors           : {D}")
+    print(f"  Bet fracs (NF)  : {NF}  {env.bet_fracs}")
+    print(f"  Capital range   : [{env.initial_capital_min:.0f}, {env.initial_capital_max:.0f}]")
+    print(f"  Bankruptcy thr  : {env.bankruptcy_threshold:.0f}  penalty={env.bankruptcy_penalty:.0f}")
     print(f"  Host obs_dim    : {host_obs_dim}  (hist_feat={HOST_HIST_FEAT})")
-    print(f"  Player obs_dim  : {player_obs_dim}  (hist_feat={PLAYER_HIST_FEAT})")
+    print(f"  Bet  obs_dim    : {pre_signal_obs_dim}  (hist_feat={PLAYER_HIST_FEAT})")
+    print(f"  Door obs_dim    : {door_obs_dim}  (hist_feat={PLAYER_HIST_FEAT})")
     print(f"  Host params     : {sum(p.numel() for p in host_agent.parameters()):,}")
-    print(f"  Player params   : {sum(p.numel() for p in player_agent.parameters()):,}")
+    print(f"  Bet  params     : {sum(p.numel() for p in bet_agent.parameters()):,}")
+    print(f"  Door params     : {sum(p.numel() for p in door_agent.parameters()):,}")
     print(f"  Transformer     : d_model={args.d_model}  nhead={args.nhead}  layers={args.num_layers}")
     print(f"  PPO             : clip_ε={args.clip_eps}  γ={args.gamma}  λ={args.gae_lambda}")
     print(f"                    epochs={args.ppo_epochs}  v_coeff={args.value_coeff}  mb={args.minibatch_size}")
@@ -153,7 +171,8 @@ def main(args: argparse.Namespace) -> None:
     runner = PPORunner(
         env,
         host_agent,
-        player_agent,
+        bet_agent,
+        door_agent,
         lr_host       = args.lr,
         lr_player     = args.lr,
         clip_eps      = args.clip_eps,
@@ -210,9 +229,10 @@ def _plot(log: list[dict], save_dir: str) -> None:
     win_ratios     = [e["win_ratio"]      for e in log]
     honesties      = [e["signal_honesty"] for e in log]
     follow_rates   = [e["follow_rate"]    for e in log]
+    avg_bets       = [e.get("avg_balance", 100.0) for e in log]
 
-    fig, axes = plt.subplots(3, 1, figsize=(10, 9), sharex=True)
-    fig.suptitle("OracleGambit  Phase 2 — Transformer + PPO",
+    fig, axes = plt.subplots(4, 1, figsize=(10, 12), sharex=True)
+    fig.suptitle("OracleGambit  Phase 2 — Transformer + PPO  (Balance System)",
                  fontsize=13, fontweight="bold")
 
     # Panel 1: rewards
@@ -238,9 +258,18 @@ def _plot(log: list[dict], save_dir: str) -> None:
     axes[2].axhline(0.25, color="gray", linestyle=":", linewidth=0.8, label="Random (0.25)")
     axes[2].set_ylabel("Rate")
     axes[2].set_ylim(0, 1)
-    axes[2].set_xlabel("Round")
     axes[2].legend(loc="upper right")
     axes[2].grid(alpha=0.3)
+
+    # Panel 4: avg bet (player confidence proxy)
+    max_bet = max(avg_bets) if avg_bets else 150
+    axes[3].plot(rounds, avg_bets, label="Avg Balance", color="goldenrod", linewidth=1.5)
+    axes[3].axhline(10.0, color="red", linestyle="--", linewidth=0.8, label="Bankruptcy (10)")
+    axes[3].set_ylabel("Avg Balance (coins)")
+    axes[3].set_ylim(0, max_bet * 1.2)
+    axes[3].set_xlabel("Round")
+    axes[3].legend(loc="upper right")
+    axes[3].grid(alpha=0.3)
 
     plt.tight_layout()
     path = os.path.join(save_dir, "training_curve.png")

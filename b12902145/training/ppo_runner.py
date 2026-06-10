@@ -4,20 +4,22 @@ PPO (Proximal Policy Optimization) runner for OracleGambit with TransformerAgent
 Algorithm overview
 ------------------
 For each batch of B rounds:
-  1. Two-phase collection:
-       a. Host observes → act() → (h_door, old_log_prob, value)
-       b. env._public_signal = h_door  (players see signal)
-       c. Each player observes → act() → (p_door, old_log_prob, value)
-       d. env.step_all() → rewards
+  1. Three-phase collection per round:
+       a. Players observe (pre-signal) → bet_agent → bet b_i ∈ {1..B_max}
+       b. Host observes (sees bet histogram) → host_agent → public_signal
+       c. Players observe (post-signal + bet context) → door_agent → door choice
+       d. env.step_all(bets, host_action, doors) → rewards
   2. After B rounds, get bootstrap values V(s_{B+1}) for GAE.
-  3. GAE advantage estimation (γ, λ) for host and per-player trajectories.
+  3. GAE advantage estimation (γ, λ) for host, bet, and door trajectories.
   4. K PPO epochs of clipped surrogate + value + entropy loss.
 
 Key design decisions
 --------------------
-* Parameter sharing — all N players share one TransformerAgent.
+* Parameter sharing — all N players share one bet_agent and one door_agent.
+* Bet and door agents share the same realised reward (settled after door choice).
+  Both are trained with PPO using their own obs/log-prob/value trajectories.
 * GAE over the B-round mini-batch trajectory:
-    - Host: 1-D sequence of B rewards / values.
+    - Host:   1-D sequence of B rewards / values.
     - Players: (B × N) → compute GAE per player (column-wise), then flatten.
 * Advantage normalisation before each PPO update.
 * Gradient clipping (L2 ≤ 1.0) for training stability.
@@ -39,22 +41,24 @@ class PPORunner:
     def __init__(
         self,
         env,
-        host_agent: TransformerAgent,
-        player_agent: TransformerAgent,
-        lr_host: float = 3e-4,
+        host_agent:   TransformerAgent,
+        bet_agent:    TransformerAgent,
+        door_agent:   TransformerAgent,
+        lr_host:   float = 3e-4,
         lr_player: float = 3e-4,
-        clip_eps: float = 0.2,
-        gamma: float = 0.99,
-        gae_lambda: float = 0.95,
-        value_coeff: float = 0.5,
+        clip_eps:      float = 0.2,
+        gamma:         float = 0.99,
+        gae_lambda:    float = 0.95,
+        value_coeff:   float = 0.5,
         entropy_coeff: float = 0.01,
-        ppo_epochs: int = 4,
-        grad_clip: float = 1.0,
-        minibatch_size: int = 256,   # mini-batch size for PPO update; improves CPU cache efficiency
+        ppo_epochs:    int   = 4,
+        grad_clip:     float = 1.0,
+        minibatch_size: int  = 256,
     ) -> None:
-        self.env = env
-        self.host_agent   = host_agent
-        self.player_agent = player_agent
+        self.env        = env
+        self.host_agent = host_agent
+        self.bet_agent  = bet_agent
+        self.door_agent = door_agent
         self.clip_eps      = clip_eps
         self.gamma         = gamma
         self.gae_lambda    = gae_lambda
@@ -64,8 +68,9 @@ class PPORunner:
         self.grad_clip     = grad_clip
         self.minibatch_size = minibatch_size
 
-        self.host_opt   = optim.Adam(host_agent.parameters(),   lr=lr_host)
-        self.player_opt = optim.Adam(player_agent.parameters(), lr=lr_player)
+        self.host_opt = optim.Adam(host_agent.parameters(), lr=lr_host)
+        self.bet_opt  = optim.Adam(bet_agent.parameters(),  lr=lr_player)
+        self.door_opt = optim.Adam(door_agent.parameters(), lr=lr_player)
 
     # ------------------------------------------------------------------
     # Batch collection
@@ -74,94 +79,120 @@ class PPORunner:
     def _collect_batch(self, batch_size: int, honest_host: bool = False) -> dict:
         """
         Run `batch_size` rounds and record experience for PPO.
-        If honest_host=True, the host always signals the correct door (Phase A).
+
+        Three micro-steps per round:
+          1. Players observe (pre-signal) → bet_agent → bet b_i ∈ {1..B_max}
+          2. Host observes (sees bet histogram) → host_agent → public_signal
+          3. Players observe (post-signal + bet) → door_agent → door choice
+          4. env.step_all(bets, host_action, doors) → rewards
 
         Returns
         -------
-        batch : {
-          "host"   : obs(B,D), action(B,), reward(B,), old_log_prob(B,), value(B,)
-          "player" : obs(B*N,D), action(B*N,), reward(B*N,), old_log_prob(B*N,),
-                     value(B*N,)    [interleaved: round0_p0…p5, round1_p0…p5, …]
-          "player_rewards_2d" : (B, N)  — per-player per-round rewards for GAE
-          "player_values_2d"  : (B, N)  — per-player per-round V(s) for GAE
-          "metrics" : list[dict]
-          "host_boot_obs"   : np.ndarray  — host obs AFTER last round (bootstrap)
-          "player_boot_obs" : np.ndarray  — player_0 obs AFTER last round (bootstrap)
-        }
+        batch : dict with keys:
+          "host"  : obs/action/reward/old_log_prob/value (B,)
+          "bet"   : obs/action/reward/old_log_prob/value (B*N,)
+          "door"  : obs/action/reward/old_log_prob/value (B*N,)
+          "player_rewards_2d"  : (B, N)
+          "bet_values_2d"      : (B, N)
+          "door_values_2d"     : (B, N)
+          "host_boot_obs"      : np.ndarray
+          "bet_boot_obs"       : np.ndarray  (player_0 pre-signal obs)
+          "door_boot_obs"      : np.ndarray  (player_0 post-signal obs, approx)
+          "metrics"            : list[dict]
         """
-        env = self.env
-        N = env.num_players
-        D = env.num_doors
+        env  = self.env
+        N    = env.num_players
+        D    = env.num_doors
+        NF   = env.num_bet_fracs
         norm = D - 1 if D > 1 else 1
 
         host_obs_l, host_act_l, host_rew_l, host_lp_l, host_val_l = [], [], [], [], []
-        p_obs_l, p_act_l, p_rew_l, p_lp_l, p_val_l = [], [], [], [], []
-        # Per-round arrays for GAE (shape: B×N after collection)
-        p_rew2d, p_val2d = [], []
+        bet_obs_l,  bet_act_l,  bet_rew_l,  bet_lp_l,  bet_val_l  = [], [], [], [], []
+        door_obs_l, door_act_l, door_rew_l, door_lp_l, door_val_l = [], [], [], [], []
+        p_rew2d, bet_val2d, door_val2d = [], [], []
         metrics_l: list[dict] = []
 
         for _ in range(batch_size):
-            # ── Host: observe → act ───────────────────────────────────────
+            # ── Phase 1: Players bet (pre-signal) ────────────────────────
+            pre_obs_batch = np.stack(
+                [env.observe_pre_signal(f"player_{pid}") for pid in range(N)]
+            )  # (N, pre_signal_obs_dim)
+            with torch.no_grad():
+                _bet_obs_t  = torch.FloatTensor(pre_obs_batch)
+                _bet_dist, _bet_vals_t = self.bet_agent(_bet_obs_t)
+                _bet_acts_t = _bet_dist.sample()           # (N,) in {0..NF-1}
+                _bet_lps_t  = _bet_dist.log_prob(_bet_acts_t)
+            _bet_frac_idxs = _bet_acts_t.numpy()           # use directly as frac_idx
+            bets_dict = {f"player_{pid}": int(_bet_frac_idxs[pid]) for pid in range(N)}
+            env._player_bets = bets_dict  # expose for host observation
+
+            # ── Phase 2: Host signals (sees bet histogram) ────────────────
             h_obs = env.observe("host")
             if honest_host:
-                h_door = env._correct_door      # Phase A: bypass policy, signal truth
-                h_lp, h_val = 0.0, 0.0         # placeholders (train_host=False in Phase A)
+                h_door = env._correct_door
+                h_lp, h_val = 0.0, 0.0
             else:
                 h_door, h_lp, h_val = self.host_agent.act(h_obs)
             h_frac = h_door / norm
+            env._public_signal = h_door  # expose signal for player door obs
 
-            env._public_signal = h_door   # expose signal so players can condition on it
-
-            # ── Players: batch all N obs into ONE forward pass ────────────
-            # Collecting obs individually (env has per-player private state),
-            # but running inference as a single (N, obs_dim) batch is ~3-4x
-            # faster than N separate act() calls on CPU.
-            p_obs_batch = np.stack(
+            # ── Phase 3: Players choose door (post-signal + bet) ──────────
+            door_obs_batch = np.stack(
                 [env.observe(f"player_{pid}") for pid in range(N)]
-            )  # (N, obs_dim)
+            )  # (N, door_obs_dim)
             with torch.no_grad():
-                _p_obs_t = torch.FloatTensor(p_obs_batch)
-                _p_dist, _p_vals_t = self.player_agent(_p_obs_t)  # (N,D), (N,)
-                _p_acts_t = _p_dist.sample()                       # (N,)
-                _p_lps_t  = _p_dist.log_prob(_p_acts_t)           # (N,)
-            _p_doors = _p_acts_t.numpy()
-            _p_lps   = _p_lps_t.numpy()
-            _p_vals  = _p_vals_t.numpy()
+                _door_obs_t  = torch.FloatTensor(door_obs_batch)
+                _door_dist, _door_vals_t = self.door_agent(_door_obs_t)
+                _door_acts_t = _door_dist.sample()
+                _door_lps_t  = _door_dist.log_prob(_door_acts_t)
+            _p_doors = _door_acts_t.numpy()
 
-            p_fracs: dict[str, float] = {
+            p_fracs = {
                 f"player_{pid}": int(_p_doors[pid]) / norm for pid in range(N)
             }
-            round_p_rews: list[float] = []
-            round_p_vals: list[float] = []
-            for pid in range(N):
-                p_obs_l.append(p_obs_batch[pid])
-                p_act_l.append(int(_p_doors[pid]))
-                p_lp_l.append(float(_p_lps[pid]))
-                p_val_l.append(float(_p_vals[pid]))
-                round_p_vals.append(float(_p_vals[pid]))
 
-            # ── Step ──────────────────────────────────────────────────────
-            rewards = env.step_all(h_frac, p_fracs)
+            # ── Settle ────────────────────────────────────────────────────
+            rewards = env.step_all(bets_dict, h_frac, p_fracs)
 
-            # ── Record ────────────────────────────────────────────────────
+            # ── Record host ───────────────────────────────────────────────
             host_obs_l.append(h_obs)
             host_act_l.append(h_door)
             host_rew_l.append(rewards["host"])
             host_lp_l.append(h_lp)
             host_val_l.append(h_val)
 
+            # ── Record bet + door (per player) ────────────────────────────
+            round_p_rews   = []
+            round_bet_vals = []
+            round_door_vals = []
             for pid in range(N):
-                r = rewards[f"player_{pid}"]
-                p_rew_l.append(r)
+                name = f"player_{pid}"
+                r = rewards[name]
+                # bet agent
+                bet_obs_l.append(pre_obs_batch[pid])
+                bet_act_l.append(int(_bet_acts_t[pid]))   # 0..B_max-1
+                bet_rew_l.append(r)
+                bet_lp_l.append(float(_bet_lps_t[pid]))
+                bet_val_l.append(float(_bet_vals_t[pid]))
+                # door agent
+                door_obs_l.append(door_obs_batch[pid])
+                door_act_l.append(int(_p_doors[pid]))
+                door_rew_l.append(r)
+                door_lp_l.append(float(_door_lps_t[pid]))
+                door_val_l.append(float(_door_vals_t[pid]))
                 round_p_rews.append(r)
+                round_bet_vals.append(float(_bet_vals_t[pid]))
+                round_door_vals.append(float(_door_vals_t[pid]))
 
             p_rew2d.append(round_p_rews)
-            p_val2d.append(round_p_vals)
+            bet_val2d.append(round_bet_vals)
+            door_val2d.append(round_door_vals)
             metrics_l.append(dict(env.last_round_info))
 
-        # Bootstrap observations (state AFTER the last collected round)
-        host_boot_obs   = env.observe("host")
-        player_boot_obs = env.observe("player_0")
+        # Bootstrap observations (after last collected round, before next bets)
+        host_boot_obs = env.observe("host")
+        bet_boot_obs  = env.observe_pre_signal("player_0")
+        door_boot_obs = env.observe("player_0")  # approx: signal=0, bet_norm=0
 
         return {
             "host": {
@@ -171,18 +202,27 @@ class PPORunner:
                 "old_log_prob": np.array(host_lp_l,   dtype=np.float32),
                 "value":        np.array(host_val_l,  dtype=np.float32),
             },
-            "player": {
-                "obs":          np.array(p_obs_l,  dtype=np.float32),
-                "action":       np.array(p_act_l,  dtype=np.int64),
-                "reward":       np.array(p_rew_l,  dtype=np.float32),
-                "old_log_prob": np.array(p_lp_l,   dtype=np.float32),
-                "value":        np.array(p_val_l,  dtype=np.float32),
+            "bet": {
+                "obs":          np.array(bet_obs_l,  dtype=np.float32),
+                "action":       np.array(bet_act_l,  dtype=np.int64),
+                "reward":       np.array(bet_rew_l,  dtype=np.float32),
+                "old_log_prob": np.array(bet_lp_l,   dtype=np.float32),
+                "value":        np.array(bet_val_l,  dtype=np.float32),
             },
-            "player_rewards_2d": np.array(p_rew2d,  dtype=np.float32),  # (B, N)
-            "player_values_2d":  np.array(p_val2d,  dtype=np.float32),  # (B, N)
-            "host_boot_obs":   host_boot_obs,
-            "player_boot_obs": player_boot_obs,
-            "metrics": metrics_l,
+            "door": {
+                "obs":          np.array(door_obs_l,  dtype=np.float32),
+                "action":       np.array(door_act_l,  dtype=np.int64),
+                "reward":       np.array(door_rew_l,  dtype=np.float32),
+                "old_log_prob": np.array(door_lp_l,   dtype=np.float32),
+                "value":        np.array(door_val_l,  dtype=np.float32),
+            },
+            "player_rewards_2d": np.array(p_rew2d,    dtype=np.float32),  # (B, N)
+            "bet_values_2d":     np.array(bet_val2d,  dtype=np.float32),  # (B, N)
+            "door_values_2d":    np.array(door_val2d, dtype=np.float32),  # (B, N)
+            "host_boot_obs":     host_boot_obs,
+            "bet_boot_obs":      bet_boot_obs,
+            "door_boot_obs":     door_boot_obs,
+            "metrics":           metrics_l,
         }
 
     # ------------------------------------------------------------------
@@ -278,22 +318,29 @@ class PPORunner:
         train_host: bool = True,
         train_players: bool = True,
     ) -> dict:
-        """Compute GAE, normalise advantages, run PPO.
+        """Compute GAE, normalise advantages, run PPO for all three agents.
 
         Set train_host=False or train_players=False to freeze that agent
         (used during curriculum phases A and B respectively).
         """
         out: dict = {
-            "host_loss": float("nan"), "player_loss": float("nan"),
-            "host_entropy": float("nan"), "player_entropy": float("nan"),
-            "host_val_loss": float("nan"), "player_val_loss": float("nan"),
+            "host_loss": float("nan"), "bet_loss": float("nan"),
+            "door_loss": float("nan"),
+            "host_entropy": float("nan"), "bet_entropy": float("nan"),
+            "door_entropy": float("nan"),
+            "host_val_loss": float("nan"), "bet_val_loss": float("nan"),
+            "door_val_loss": float("nan"),
         }
 
         # ── Host ─────────────────────────────────────────────────────────
         if train_host:
             hd = batch["host"]
             h_boot = self.host_agent.value(batch["host_boot_obs"])
-            h_adv, h_ret = self._compute_gae(hd["reward"], hd["value"], h_boot)
+            h_rew = hd["reward"]
+            # Reward-scale normalisation for host (same logic as player side)
+            h_rew_scale = max(float(h_rew.std()), 1.0)
+            h_rew = h_rew / h_rew_scale
+            h_adv, h_ret = self._compute_gae(h_rew, hd["value"], h_boot)
             h_adv = (h_adv - h_adv.mean()) / (h_adv.std() + 1e-8)
 
             h_obs_t    = torch.FloatTensor(hd["obs"])
@@ -310,38 +357,60 @@ class PPORunner:
             out["host_entropy"]  = h_ent
             out["host_val_loss"] = h_val_loss
 
-        # ── Players (parameter sharing: pool all B×N samples) ─────────────
+        # ── Bet + Door (parameter sharing across N players) ───────────────
         if train_players:
             p_rew2d = batch["player_rewards_2d"]   # (B, N)
-            p_val2d = batch["player_values_2d"]    # (B, N)
-            p_boot  = self.player_agent.value(batch["player_boot_obs"])
+            B, Np   = p_rew2d.shape
+            # Reward-scale normalisation: prevents value-function divergence
+            # when player balances (and thus bets/rewards) grow very large.
+            # max(..., 1.0) avoids amplifying noise in low-reward phases.
+            rew_scale = max(float(p_rew2d.std()), 1.0)
+            p_rew2d   = p_rew2d / rew_scale
 
-            B, Np = p_rew2d.shape
-            p_adv2d = np.zeros_like(p_rew2d)
-            p_ret2d = np.zeros_like(p_rew2d)
-            for pid in range(Np):
-                p_adv2d[:, pid], p_ret2d[:, pid] = self._compute_gae(
-                    p_rew2d[:, pid], p_val2d[:, pid], p_boot
-                )
+            # GAE helper for (B, N) reward/value grids
+            def _player_gae(val2d, boot_val):
+                adv2d = np.zeros_like(val2d)
+                ret2d = np.zeros_like(val2d)
+                for pid in range(Np):
+                    adv2d[:, pid], ret2d[:, pid] = self._compute_gae(
+                        p_rew2d[:, pid], val2d[:, pid], boot_val
+                    )
+                flat_adv = adv2d.flatten()
+                flat_ret = ret2d.flatten()
+                flat_adv = (flat_adv - flat_adv.mean()) / (flat_adv.std() + 1e-8)
+                return flat_adv, flat_ret
 
-            p_adv_flat = p_adv2d.flatten()
-            p_ret_flat = p_ret2d.flatten()
-            p_adv_flat = (p_adv_flat - p_adv_flat.mean()) / (p_adv_flat.std() + 1e-8)
-
-            pd = batch["player"]
-            p_obs_t    = torch.FloatTensor(pd["obs"])
-            p_act_t    = torch.LongTensor(pd["action"])
-            p_old_lp_t = torch.FloatTensor(pd["old_log_prob"])
-            p_adv_t    = torch.FloatTensor(p_adv_flat)
-            p_ret_t    = torch.FloatTensor(p_ret_flat)
-
-            p_actor_loss, p_val_loss, p_ent = self._ppo_update(
-                self.player_agent, self.player_opt,
-                p_obs_t, p_act_t, p_old_lp_t, p_adv_t, p_ret_t,
+            # Bet agent update
+            bet_boot = self.bet_agent.value(batch["bet_boot_obs"])
+            b_adv_flat, b_ret_flat = _player_gae(batch["bet_values_2d"], bet_boot)
+            bd = batch["bet"]
+            b_actor_loss, b_val_loss, b_ent = self._ppo_update(
+                self.bet_agent, self.bet_opt,
+                torch.FloatTensor(bd["obs"]),
+                torch.LongTensor(bd["action"]),
+                torch.FloatTensor(bd["old_log_prob"]),
+                torch.FloatTensor(b_adv_flat),
+                torch.FloatTensor(b_ret_flat),
             )
-            out["player_loss"]     = p_actor_loss + self.value_coeff * p_val_loss
-            out["player_entropy"]  = p_ent
-            out["player_val_loss"] = p_val_loss
+            out["bet_loss"]     = b_actor_loss + self.value_coeff * b_val_loss
+            out["bet_entropy"]  = b_ent
+            out["bet_val_loss"] = b_val_loss
+
+            # Door agent update
+            door_boot = self.door_agent.value(batch["door_boot_obs"])
+            d_adv_flat, d_ret_flat = _player_gae(batch["door_values_2d"], door_boot)
+            dd = batch["door"]
+            d_actor_loss, d_val_loss, d_ent = self._ppo_update(
+                self.door_agent, self.door_opt,
+                torch.FloatTensor(dd["obs"]),
+                torch.LongTensor(dd["action"]),
+                torch.FloatTensor(dd["old_log_prob"]),
+                torch.FloatTensor(d_adv_flat),
+                torch.FloatTensor(d_ret_flat),
+            )
+            out["door_loss"]     = d_actor_loss + self.value_coeff * d_val_loss
+            out["door_entropy"]  = d_ent
+            out["door_val_loss"] = d_val_loss
 
         return out
 
@@ -352,7 +421,7 @@ class PPORunner:
     @staticmethod
     def _agg_metrics(metrics_list: list[dict]) -> dict:
         win_ratios, host_rews, player_rews = [], [], []
-        honesties, follow_rates = [], []
+        honesties, follow_rates, avg_bet_fracs, avg_balances = [], [], [], []
 
         for m in metrics_list:
             win_ratios.append(m["win_ratio"])
@@ -368,6 +437,8 @@ class PPORunner:
                     if door == m["public_signal"]
                 )
                 follow_rates.append(followed / n)
+            avg_bet_fracs.append(m.get("avg_bet_frac_idx", 0.0))
+            avg_balances.append(m.get("avg_balance", 100.0))
 
         return {
             "win_ratio":      float(np.mean(win_ratios)),
@@ -375,6 +446,8 @@ class PPORunner:
             "player_reward":  float(np.mean(player_rews)),
             "signal_honesty": float(np.mean(honesties)),
             "follow_rate":    float(np.mean(follow_rates)) if follow_rates else 0.0,
+            "avg_bet_frac":   float(np.mean(avg_bet_fracs)),
+            "avg_balance":    float(np.mean(avg_balances)),
         }
 
     # ------------------------------------------------------------------
@@ -444,10 +517,10 @@ class PPORunner:
 
         _CSV_FIELDS = [
             "round", "host_reward", "player_reward", "win_ratio",
-            "signal_honesty", "follow_rate",
-            "host_loss", "player_loss",
-            "host_entropy", "player_entropy",
-            "host_val_loss", "player_val_loss",
+            "signal_honesty", "follow_rate", "avg_bet_frac", "avg_balance",
+            "host_loss", "bet_loss", "door_loss",
+            "host_entropy", "bet_entropy", "door_entropy",
+            "host_val_loss", "bet_val_loss", "door_val_loss",
             "elapsed_s",
         ]
 
@@ -610,10 +683,10 @@ class PPORunner:
 
         _CSV_FIELDS = [
             "phase", "round", "host_reward", "player_reward", "win_ratio",
-            "signal_honesty", "follow_rate",
-            "host_loss", "player_loss",
-            "host_entropy", "player_entropy",
-            "host_val_loss", "player_val_loss",
+            "signal_honesty", "follow_rate", "avg_bet_frac", "avg_balance",
+            "host_loss", "bet_loss", "door_loss",
+            "host_entropy", "bet_entropy", "door_entropy",
+            "host_val_loss", "bet_val_loss", "door_val_loss",
             "elapsed_s",
         ]
 
@@ -677,17 +750,22 @@ def _print_log(e: dict) -> None:
     pr  = e["player_reward"]
     hc  = G if hr >= 0 else R
     pc  = G if pr >= 0 else R
-    h_ent  = e.get("host_entropy",   float("nan"))
-    p_ent  = e.get("player_entropy", float("nan"))
-    h_loss = e.get("host_loss",      float("nan"))
-    p_loss = e.get("player_loss",    float("nan"))
+    h_ent   = e.get("host_entropy",  float("nan"))
+    b_ent   = e.get("bet_entropy",   float("nan"))
+    d_ent   = e.get("door_entropy",  float("nan"))
+    h_loss  = e.get("host_loss",     float("nan"))
+    b_loss  = e.get("bet_loss",      float("nan"))
+    d_loss  = e.get("door_loss",     float("nan"))
+    avg_bf  = e.get("avg_bet_frac",  0.0)
+    avg_bal = e.get("avg_balance",   100.0)
     print(
         f"[PPO][{e['round']:>8}]  "
         f"H={hc}{hr:+.3f}{RST}  P={pc}{pr:+.3f}{RST}  "
         f"wr={e['win_ratio']:.3f}  "
         f"hon={e['signal_honesty']:.2f}  fol={e['follow_rate']:.2f}  "
-        f"{D}loss=({h_loss:.3f},{p_loss:.3f})  "
-        f"ent=({h_ent:.3f},{p_ent:.3f}){RST}  "
+        f"bf={avg_bf:.2f}  bal={avg_bal:.1f}  "
+        f"{D}loss=(h:{h_loss:.3f} b:{b_loss:.3f} d:{d_loss:.3f})  "
+        f"ent=(h:{h_ent:.3f} b:{b_ent:.3f} d:{d_ent:.3f}){RST}  "
         f"({e['elapsed_s']:.0f}s)"
     )
 
@@ -698,18 +776,23 @@ def _print_log_curriculum(e: dict) -> None:
     pr    = e["player_reward"]
     hc    = G if hr >= 0 else R
     pc    = G if pr >= 0 else R
-    h_ent = e.get("host_entropy",   float("nan"))
-    p_ent = e.get("player_entropy", float("nan"))
-    h_loss = e.get("host_loss",     float("nan"))
-    p_loss = e.get("player_loss",   float("nan"))
-    phase  = e.get("phase", "?")
+    h_ent   = e.get("host_entropy",  float("nan"))
+    b_ent   = e.get("bet_entropy",   float("nan"))
+    d_ent   = e.get("door_entropy",  float("nan"))
+    h_loss  = e.get("host_loss",     float("nan"))
+    b_loss  = e.get("bet_loss",      float("nan"))
+    d_loss  = e.get("door_loss",     float("nan"))
+    avg_bf  = e.get("avg_bet_frac",  0.0)
+    avg_bal = e.get("avg_balance",   100.0)
+    phase   = e.get("phase", "?")
     print(
         f"[PPO][{phase}][{e['round']:>8}]  "
         f"H={hc}{hr:+.3f}{RST}  P={pc}{pr:+.3f}{RST}  "
         f"wr={e['win_ratio']:.3f}  "
         f"hon={e['signal_honesty']:.2f}  fol={e['follow_rate']:.2f}  "
-        f"{D}loss=({h_loss:.3f},{p_loss:.3f})  "
-        f"ent=({h_ent:.3f},{p_ent:.3f}){RST}  "
+        f"bf={avg_bf:.2f}  bal={avg_bal:.1f}  "
+        f"{D}loss=(h:{h_loss:.3f} b:{b_loss:.3f} d:{d_loss:.3f})  "
+        f"ent=(h:{h_ent:.3f} b:{b_ent:.3f} d:{d_ent:.3f}){RST}  "
         f"({e['elapsed_s']:.0f}s)"
     )
 
@@ -720,7 +803,11 @@ def _save_checkpoints(runner: PPORunner, save_dir: str, rounds: int) -> None:
         os.path.join(save_dir, f"host_{rounds}.pt"),
     )
     torch.save(
-        runner.player_agent.state_dict(),
-        os.path.join(save_dir, f"player_{rounds}.pt"),
+        runner.bet_agent.state_dict(),
+        os.path.join(save_dir, f"bet_{rounds}.pt"),
+    )
+    torch.save(
+        runner.door_agent.state_dict(),
+        os.path.join(save_dir, f"door_{rounds}.pt"),
     )
     print(f"  [ckpt] saved at round {rounds}")
