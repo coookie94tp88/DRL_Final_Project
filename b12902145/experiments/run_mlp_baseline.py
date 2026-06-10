@@ -33,12 +33,51 @@ from training.reinforce_runner import ReinforceRunner
 
 
 # ---------------------------------------------------------------------------
+# Log tee — mirror stdout to a file (ANSI codes preserved in both)
+# ---------------------------------------------------------------------------
+
+class _LogTee:
+    """Duplicate sys.stdout to a file so the terminal and a log file are in sync.
+
+    ANSI escape codes are written as-is, so the file can be replayed with::
+
+        cat terminal.log          # colours shown in any colour-capable terminal
+        less -R terminal.log      # colours + scrolling
+    """
+
+    def __init__(self, path: str) -> None:
+        self._path   = path
+        self._file   = open(path, "w", encoding="utf-8")  # noqa: WPS515
+        self._stdout = sys.stdout
+        sys.stdout   = self
+
+    def write(self, data: str) -> None:
+        self._stdout.write(data)
+        self._file.write(data)
+
+    def flush(self) -> None:
+        self._stdout.flush()
+        self._file.flush()
+
+    def fileno(self) -> int:          # needed by some libraries
+        return self._stdout.fileno()
+
+    def close(self) -> None:
+        sys.stdout = self._stdout
+        self._file.close()
+        self._stdout.write(f"\nTerminal log → {self._path}\n")
+        self._stdout.flush()
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    os.makedirs(args.save_dir, exist_ok=True)
+    _tee = _LogTee(os.path.join(args.save_dir, "terminal.log"))
 
     # ── Environment ──────────────────────────────────────────────────────
     env = OracleGambitEnv(
@@ -91,12 +130,14 @@ def main(args: argparse.Namespace) -> None:
         batch_size=args.batch_size,
         log_interval=args.log_interval,
         save_interval=args.save_interval,
+        spotlight_interval=args.spotlight_interval,
         save_dir=args.save_dir,
     )
 
     # ── Plot & save ───────────────────────────────────────────────────────
     if log:
         _plot(log, args.save_dir)
+    _tee.close()
 
 
 # ---------------------------------------------------------------------------
@@ -163,8 +204,10 @@ def _parse() -> argparse.Namespace:
     p.add_argument("--lr",             type=float, default=3e-4)
     p.add_argument("--entropy_coeff",  type=float, default=0.01)
     p.add_argument("--log_interval",   type=int,   default=2_000)
-    p.add_argument("--save_interval",  type=int,   default=20_000)
-    p.add_argument("--save_dir",       type=str,   default="checkpoints/mlp_reinforce")
+    p.add_argument("--save_interval",   type=int,   default=20_000)
+    p.add_argument("--spotlight_interval", type=int, default=10_000,
+                   help="Print round-level spotlight every N rounds (0=disable)")
+    p.add_argument("--save_dir",        type=str,   default="checkpoints/mlp_reinforce")
     p.add_argument("--seed",           type=int,   default=42)
     return p.parse_args()
 
